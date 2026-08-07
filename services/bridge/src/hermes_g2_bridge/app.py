@@ -26,6 +26,23 @@ from .stt import SpeechError, transcribe
 logger = logging.getLogger(__name__)
 
 
+class ExternalBasePathMiddleware:
+    def __init__(self, app, base_path: str):
+        self.app = app
+        self.base_path = "/" + base_path.strip("/") if base_path.strip("/") else ""
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if self.base_path and scope["type"] in {"http", "websocket"} and (
+            path == self.base_path or path.startswith(f"{self.base_path}/")
+        ):
+            scope = dict(scope)
+            scope["root_path"] = f"{scope.get('root_path', '')}{self.base_path}"
+            scope["path"] = path[len(self.base_path):] or "/"
+            scope["raw_path"] = scope["path"].encode()
+        await self.app(scope, receive, send)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings()
     store = Store(config.database_path)
@@ -50,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await hermes.close()
 
     app = FastAPI(title="Hermes G2 Bridge", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(ExternalBasePathMiddleware, base_path=config.external_base_path)
     app.state.store, app.state.settings, app.state.control = store, config, service
 
     @app.get("/health")

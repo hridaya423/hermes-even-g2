@@ -73,12 +73,10 @@ class HermesConnectionService : Service() {
     }
 
     private fun notifyIfActionable(event: DurableEvent) {
-        val completionOwnedByG2 = event.kind == "run.completed" && event.payload?.toString()?.contains("initiatedByG2\":true") == true
-        if (event.kind !in setOf("approval.required", "attention.created", "run.failed") && !completionOwnedByG2) return
-        val title = when (event.kind) { "approval.required" -> "Hermes needs approval"; "run.failed" -> "Hermes run failed"; "run.completed" -> "Hermes finished"; else -> "Hermes needs input" }
+        val policy = NotificationPolicy.forEvent(event) ?: return
         val intent = Intent(this, MainActivity::class.java).putExtra("sessionId", event.sessionId).putExtra("runId", event.runId)
         val pending = PendingIntent.getActivity(this, event.eventId.hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val notification = NotificationCompat.Builder(this, ATTENTION_CHANNEL).setSmallIcon(android.R.drawable.stat_notify_chat).setContentTitle(title).setContentText("Open Hermes G2 to review privately").setContentIntent(pending).setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH).build()
+        val notification = NotificationCompat.Builder(this, ATTENTION_CHANNEL).setSmallIcon(android.R.drawable.stat_notify_chat).setContentTitle(policy.title).setContentText("Open Hermes G2 to review privately").setContentIntent(pending).setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH).build()
         getSystemService(NotificationManager::class.java).notify(event.eventId.hashCode(), notification)
     }
 
@@ -87,4 +85,3 @@ class HermesConnectionService : Service() {
     private fun updateStatus(text: String) = getSystemService(NotificationManager::class.java).notify(CONNECTION_NOTIFICATION, statusNotification(text))
     companion object { const val CONNECTION_CHANNEL = "hermes_connection"; const val ATTENTION_CHANNEL = "hermes_attention"; const val CONNECTION_NOTIFICATION = 4102 }
 }
-

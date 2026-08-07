@@ -1,4 +1,3 @@
-import hashlib
 import os
 from typing import Any
 
@@ -15,13 +14,20 @@ class HermesG2Observer:
     async def _send(self, kind: str, kwargs: dict[str, Any]) -> None:
         if not self.secret:
             return
-        session_id = str(kwargs.get("session_id") or kwargs.get("sessionId") or "") or None
-        run_id = str(kwargs.get("run_id") or kwargs.get("runId") or "") or None
+        session_id = str(
+            kwargs.get("session_id") or kwargs.get("sessionId") or kwargs.get("session_key") or ""
+        ) or None
+        run_id = str(
+            kwargs.get("run_id") or kwargs.get("runId") or kwargs.get("turn_id") or ""
+        ) or None
         safe = {
             "hook": kind,
             "tool": kwargs.get("tool_name") or kwargs.get("tool"),
             "status": kwargs.get("status"),
             "source": kwargs.get("source"),
+            "choice": kwargs.get("choice"),
+            "patternKey": kwargs.get("pattern_key"),
+            "surface": kwargs.get("surface"),
             "errorType": type(kwargs["error"]).__name__ if kwargs.get("error") else None,
         }
         try:
@@ -31,7 +37,7 @@ class HermesG2Observer:
                     headers={"X-Plugin-Secret": self.secret},
                     json={"kind": self._event_kind(kind), "source": "plugin", "sessionId": session_id, "runId": run_id, "payload": safe},
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 -- observation must never break an agent turn
             return
 
     @staticmethod
@@ -40,7 +46,9 @@ class HermesG2Observer:
             "on_session_start": "session.updated", "on_session_end": "session.updated",
             "on_session_finalize": "message.completed", "on_session_reset": "session.updated",
             "pre_tool_call": "tool.started", "post_tool_call": "tool.completed",
-            "post_llm_call": "run.progress", "subagent_stop": "subagent.completed",
+            "post_llm_call": "run.progress", "subagent_start": "subagent.started",
+            "subagent_stop": "subagent.completed", "pre_approval_request": "approval.required",
+            "post_approval_response": "approval.resolved",
         }[hook]
 
     async def on_session_start(self, **kwargs): await self._send("on_session_start", kwargs)
@@ -50,5 +58,25 @@ class HermesG2Observer:
     async def pre_tool_call(self, **kwargs): await self._send("pre_tool_call", kwargs)
     async def post_tool_call(self, **kwargs): await self._send("post_tool_call", kwargs)
     async def post_llm_call(self, **kwargs): await self._send("post_llm_call", kwargs)
+    async def subagent_start(self, **kwargs): await self._send("subagent_start", kwargs)
     async def subagent_stop(self, **kwargs): await self._send("subagent_stop", kwargs)
+    async def pre_approval_request(self, **kwargs): await self._send("pre_approval_request", kwargs)
+    async def post_approval_response(self, **kwargs): await self._send("post_approval_response", kwargs)
 
+
+def register(ctx) -> None:
+    observer = HermesG2Observer()
+    for hook_name in (
+        "on_session_start",
+        "on_session_end",
+        "on_session_finalize",
+        "on_session_reset",
+        "pre_tool_call",
+        "post_tool_call",
+        "post_llm_call",
+        "subagent_start",
+        "subagent_stop",
+        "pre_approval_request",
+        "post_approval_response",
+    ):
+        ctx.register_hook(hook_name, getattr(observer, hook_name))

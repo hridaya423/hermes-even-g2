@@ -1,4 +1,5 @@
-from .plugin import HermesG2Observer
+# ruff: noqa: N999
 
-__all__ = ["HermesG2Observer"]
+from .plugin import HermesG2Observer, register
 
+__all__ = ["HermesG2Observer", "register"]
