@@ -129,6 +129,16 @@ class ControlService:
             renamed = await self.hermes.rename_session(action.session_id, title)
             await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload=renamed))
             return renamed
+        if kind == ActionKind.SET_SESSION_MODEL:
+            if not self.capabilities.get("models"):
+                raise ValueError("installed Hermes does not advertise model options")
+            provider = str(action.payload.get("provider", "")).strip()
+            model = str(action.payload.get("model", "")).strip()
+            if not provider or not model:
+                raise ValueError("provider and model are required")
+            response = await self.hermes.set_session_model(action.session_id, provider, model)
+            await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload={"provider": provider, "model": model, "modelLock": "accepted"}))
+            return response
         if kind in APPROVAL_MAP:
             if not self.capabilities.get("sessionApprovalResponse"):
                 raise ValueError("installed Hermes does not advertise native session approval responses")

@@ -21,6 +21,7 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
     suspend fun messages(sessionId: String, limit: Int = 100, offset: Int = 0): MessagePage = get("/v1/sessions/$sessionId/messages?limit=$limit&offset=$offset")
     suspend fun jobs(): JobList = get("/v1/jobs")
     suspend fun models(): String = raw("/v1/models")
+    suspend fun modelOptions(): ModelOptions = get("/v1/model-options")
     suspend fun skills(): String = raw("/v1/skills")
     suspend fun audit(): String = raw("/v1/audit")
     suspend fun devices(): List<DeviceRecord> = get("/v1/devices")

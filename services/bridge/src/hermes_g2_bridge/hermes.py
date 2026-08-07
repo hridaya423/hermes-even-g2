@@ -127,6 +127,13 @@ class HermesClient:
         session = value.get("session", value) if isinstance(value, dict) else value
         return self._normalize_session(session)
 
+    async def set_session_model(self, session_id: str, provider: str, model: str) -> Any:
+        return await self._request(
+            "POST",
+            f"/api/sessions/{session_id}/model",
+            json={"provider": provider, "model": model},
+        )
+
     async def stream_prompt(self, session_id: str, text: str, options: dict[str, Any] | None = None) -> AsyncIterator[dict[str, Any]]:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
@@ -169,6 +176,9 @@ class HermesClient:
 
     async def models(self) -> Any:
         return await self._request("GET", "/v1/models")
+
+    async def model_options(self) -> Any:
+        return await self._request("GET", "/api/model/options")
 
     async def skills(self) -> dict[str, Any]:
         skills, toolsets = await asyncio.gather(self._request("GET", "/v1/skills"), self._request("GET", "/v1/toolsets"))

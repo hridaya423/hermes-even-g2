@@ -140,6 +140,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "installed Hermes does not advertise model options")
         return await hermes.models()
 
+    @app.get("/v1/model-options")
+    async def model_options(device=Depends(require_scope("sessions:read"))):
+        if not service.capabilities.get("models"):
+            raise HTTPException(404, "installed Hermes does not advertise model options")
+        return await hermes.model_options()
+
     @app.get("/v1/skills")
     async def skills(device=Depends(require_scope("sessions:read"))):
         if not service.capabilities.get("skills"):

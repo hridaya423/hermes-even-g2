@@ -125,3 +125,26 @@ async def test_rename_session_targets_exact_native_session():
     assert renamed["id"] == "session-1"
     assert renamed["title"] == "Renamed"
     await value.close()
+
+
+async def test_session_model_lock_targets_exact_native_session():
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = request.content
+        return httpx.Response(200, json={"object": "hermes.session.model_lock"})
+
+    value = HermesClient("http://hermes.test", "secret")
+    await value.client.aclose()
+    value.client = httpx.AsyncClient(
+        base_url="http://hermes.test", transport=httpx.MockTransport(handler)
+    )
+    await value.set_session_model("session-1", "provider-1", "model-1")
+    assert captured == {
+        "method": "POST",
+        "path": "/api/sessions/session-1/model",
+        "body": b'{"provider":"provider-1","model":"model-1"}',
+    }
+    await value.close()

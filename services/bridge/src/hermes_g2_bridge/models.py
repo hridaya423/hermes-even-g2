@@ -11,6 +11,7 @@ class ActionKind(StrEnum):
     CREATE_SESSION = "createSession"
     FORK_SESSION = "forkSession"
     RENAME_SESSION = "renameSession"
+    SET_SESSION_MODEL = "setSessionModel"
     PROMPT = "prompt"
     QUEUE_PROMPT = "queuePrompt"
     STOP_RUN = "stopRun"
@@ -41,7 +42,7 @@ class AgentAction(BaseModel):
     @model_validator(mode="after")
     def require_exact_targets(self):
         session_actions = {
-            ActionKind.FORK_SESSION, ActionKind.RENAME_SESSION, ActionKind.PROMPT, ActionKind.QUEUE_PROMPT,
+            ActionKind.FORK_SESSION, ActionKind.RENAME_SESSION, ActionKind.SET_SESSION_MODEL, ActionKind.PROMPT, ActionKind.QUEUE_PROMPT,
             ActionKind.PIN_SESSION, ActionKind.UNPIN_SESSION,
         }
         run_actions = {

@@ -25,3 +25,8 @@ def test_run_controls_require_session_and_run():
 def test_rename_requires_exact_session():
     with pytest.raises(ValidationError):
         AgentAction.model_validate(action(kind="renameSession", sessionId=None))
+
+
+def test_model_selection_requires_exact_session():
+    with pytest.raises(ValidationError):
+        AgentAction.model_validate(action(kind="setSessionModel", sessionId=None))

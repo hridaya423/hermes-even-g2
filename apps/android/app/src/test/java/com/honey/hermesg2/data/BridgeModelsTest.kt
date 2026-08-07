@@ -25,4 +25,13 @@ class BridgeModelsTest {
         assertEquals(listOf("sessions:read", "devices:manage"), devices.single().scopes)
         assertEquals(42, devices.single().acknowledgedCursor)
     }
+
+    @Test fun `live model options decode authenticated provider choices`() {
+        val value = json.decodeFromString<ModelOptions>(
+            """{"provider":"openai","model":"gpt-current","providers":[{"slug":"openai","name":"OpenAI","authenticated":true,"models":["gpt-current","gpt-next"],"auth_type":"api_key"}]}"""
+        )
+        assertEquals("openai", value.provider)
+        assertEquals("gpt-current", value.model)
+        assertEquals(listOf("gpt-current", "gpt-next"), value.providers.single().models)
+    }
 }
