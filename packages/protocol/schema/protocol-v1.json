@@ -10,7 +10,7 @@
       "type": "object",
       "required": ["kind", "deviceId", "idempotencyKey", "createdAt", "payload"],
       "properties": {
-        "kind": {"enum": ["createSession", "forkSession", "prompt", "queuePrompt", "stopRun", "approveOnce", "approveSession", "approveAlways", "deny", "pinSession", "unpinSession", "runJob", "pauseJob", "resumeJob", "acknowledge"]},
+        "kind": {"enum": ["createSession", "forkSession", "renameSession", "prompt", "queuePrompt", "stopRun", "approveOnce", "approveSession", "approveAlways", "deny", "pinSession", "unpinSession", "runJob", "pauseJob", "resumeJob", "acknowledge"]},
         "deviceId": {"type": "string", "minLength": 1},
         "idempotencyKey": {"type": "string", "minLength": 8},
         "sessionId": {"type": "string"},

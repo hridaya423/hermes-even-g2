@@ -122,6 +122,11 @@ class HermesClient:
         session = value.get("session", value) if isinstance(value, dict) else value
         return self._normalize_session(session)
 
+    async def rename_session(self, session_id: str, title: str) -> Any:
+        value = await self._request("PATCH", f"/api/sessions/{session_id}", json={"title": title})
+        session = value.get("session", value) if isinstance(value, dict) else value
+        return self._normalize_session(session)
+
     async def stream_prompt(self, session_id: str, text: str, options: dict[str, Any] | None = None) -> AsyncIterator[dict[str, Any]]:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:

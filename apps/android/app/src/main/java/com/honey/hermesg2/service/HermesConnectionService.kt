@@ -11,6 +11,7 @@ import com.honey.hermesg2.MainActivity
 import com.honey.hermesg2.data.BridgeClient
 import com.honey.hermesg2.data.DurableEvent
 import com.honey.hermesg2.data.DurableCursor
+import com.honey.hermesg2.data.AgentAction
 import com.honey.hermesg2.data.SecureCredentials
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,6 +27,8 @@ import okhttp3.WebSocketListener
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import java.util.concurrent.atomic.AtomicLong
+import java.time.Instant
+import java.util.UUID
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -83,7 +86,21 @@ class HermesConnectionService : Service() {
         eventSource?.cancel()
         eventSource = bridge.events(cursor.get(), object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) = updateStatus("Connected to Hermes (fallback)")
-            override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) = handleEvent(data)
+            override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) = handleEvent(data) { event ->
+                scope.launch {
+                    runCatching {
+                        bridge.action(
+                            AgentAction(
+                                kind = "acknowledge",
+                                deviceId = SecureCredentials(this@HermesConnectionService).load()!!.deviceId,
+                                idempotencyKey = "sse-${event.eventId}",
+                                createdAt = Instant.now().toString(),
+                                payload = mapOf("cursor" to event.cursor.toString()),
+                            )
+                        )
+                    }
+                }
+            }
             override fun onClosed(eventSource: EventSource) = schedule(bridge, attempt + 1)
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) = schedule(bridge, attempt + 1)
         })

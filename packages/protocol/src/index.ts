@@ -95,7 +95,7 @@ export type DurableEvent<T = unknown> = {
 };
 
 export type ActionKind =
-  | "createSession" | "forkSession" | "prompt" | "queuePrompt" | "stopRun"
+  | "createSession" | "forkSession" | "renameSession" | "prompt" | "queuePrompt" | "stopRun"
   | "approveOnce" | "approveSession" | "approveAlways" | "deny"
   | "pinSession" | "unpinSession" | "runJob" | "pauseJob" | "resumeJob"
   | "acknowledge";

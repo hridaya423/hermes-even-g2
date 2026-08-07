@@ -97,3 +97,31 @@ async def test_create_session_unwraps_live_020_response():
     assert created["id"] == "created"
     assert created["source"] == "api_server"
     await value.close()
+
+
+async def test_rename_session_targets_exact_native_session():
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = request.content
+        return httpx.Response(
+            200,
+            json={"session": {"id": "session-1", "title": "Renamed"}},
+        )
+
+    value = HermesClient("http://hermes.test", "secret")
+    await value.client.aclose()
+    value.client = httpx.AsyncClient(
+        base_url="http://hermes.test", transport=httpx.MockTransport(handler)
+    )
+    renamed = await value.rename_session("session-1", "Renamed")
+    assert captured == {
+        "method": "PATCH",
+        "path": "/api/sessions/session-1",
+        "body": b'{"title":"Renamed"}',
+    }
+    assert renamed["id"] == "session-1"
+    assert renamed["title"] == "Renamed"
+    await value.close()

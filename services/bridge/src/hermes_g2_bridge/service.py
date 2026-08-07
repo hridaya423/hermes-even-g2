@@ -122,6 +122,13 @@ class ControlService:
             return {**created, "source": "even_g2"}
         if kind == ActionKind.FORK_SESSION:
             return await self.hermes.fork_session(action.session_id, action.payload)
+        if kind == ActionKind.RENAME_SESSION:
+            title = str(action.payload.get("title", "")).strip()
+            if not title or len(title) > 120:
+                raise ValueError("session title must contain 1 to 120 characters")
+            renamed = await self.hermes.rename_session(action.session_id, title)
+            await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload=renamed))
+            return renamed
         if kind in APPROVAL_MAP:
             if not self.capabilities.get("sessionApprovalResponse"):
                 raise ValueError("installed Hermes does not advertise native session approval responses")
