@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.honey.hermes-api</string>
+  <key>ProgramArguments</key><array><string>/opt/hermes/bin/hermes</string><string>gateway</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>API_SERVER_ENABLED</key><string>true</string><key>API_SERVER_HOST</key><string>127.0.0.1</string><key>API_SERVER_PORT</key><string>8642</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/var/log/hermes-g2/hermes.log</string><key>StandardErrorPath</key><string>/var/log/hermes-g2/hermes.error.log</string>
+</dict></plist>
+

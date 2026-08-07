@@ -1,0 +1,33 @@
+[project]
+name = "hermes-g2-bridge"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "argon2-cffi>=23.1",
+  "aiosqlite>=0.20",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "pydantic-settings>=2.7",
+  "python-multipart>=0.0.20",
+  "uvicorn[standard]>=0.34"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "ruff>=0.9"]
+
+[project.scripts]
+hermes-g2-bridge = "hermes_g2_bridge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["B008", "BLE001", "SIM117"]

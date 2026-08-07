@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.venv/
+.gradle/
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+*.ehpk
+*.apk
+local.properties

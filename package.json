@@ -1,0 +1,13 @@
+{
+  "name": "hermes-even-g2",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/hub", "packages/protocol"],
+  "scripts": {
+    "build": "npm run build -w @hermes-g2/protocol && npm run build -w @hermes-g2/hub",
+    "test": "npm run test -w @hermes-g2/protocol && npm run test -w @hermes-g2/hub",
+    "typecheck": "npm run typecheck -w @hermes-g2/protocol && npm run typecheck -w @hermes-g2/hub"
+  },
+  "engines": {"node": ">=22"}
+}
+

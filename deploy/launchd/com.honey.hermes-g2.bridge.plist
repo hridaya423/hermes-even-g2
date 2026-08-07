@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.honey.hermes-g2.bridge</string>
+  <key>ProgramArguments</key><array><string>/opt/hermes-g2/venv/bin/hermes-g2-bridge</string><string>serve</string></array>
+  <key>WorkingDirectory</key><string>/var/lib/hermes-g2</string>
+  <key>EnvironmentVariables</key><dict><key>HERMES_G2_ENV_FILE</key><string>/etc/hermes-g2/bridge.env</string></dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/var/log/hermes-g2/bridge.log</string>
+  <key>StandardErrorPath</key><string>/var/log/hermes-g2/bridge.error.log</string>
+</dict></plist>
+

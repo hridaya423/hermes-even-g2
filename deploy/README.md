@@ -1,0 +1,13 @@
+# Mac mini deployment
+
+The boot path uses LaunchDaemons because core Hermes chat must work without an Aqua login session. The bridge and Hermes bind only to loopback. Tailscale Serve terminates private HTTPS/WSS and forwards `/hermes-g2` to the bridge; never forward port 8642.
+
+1. Pin and patch the Mac mini Hermes checkout, then run `tests/gateway/test_session_api.py`.
+2. Set `API_SERVER_KEY` in Hermes's root-owned environment and install the Hermes LaunchDaemon.
+3. Run `sudo scripts/install-mac-mini.sh`; on its first pass it creates `/etc/hermes-g2/bridge.env` with mode `0600` and stops for secret editing.
+4. Install `whisper.cpp`, benchmark quantized English models, and put the winner at the configured model path.
+5. Run `sudo scripts/configure-tailscale.sh`, confirm the MagicDNS HTTPS origin, and generate separate `android`, `hub`, and `simulator` pairing codes.
+6. Run `hermes-g2-bridge doctor` without copying its secret environment into a shell history.
+
+GUI-dependent tools remain unavailable while the Mac mini is logged out. The bridge exposes this separately from core readiness; it does not restart or silently rerun a failed turn.
+

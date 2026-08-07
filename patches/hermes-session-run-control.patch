@@ -1,0 +1,210 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index d7bf533..05f4ebe 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -3115,6 +3115,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "model_options": True,
+                 "session_chat": True,
+                 "session_chat_streaming": True,
++                "session_run_control": True,
++                "session_approval_response": True,
+                 "session_fork": True,
+                 "session_model_lock": True,
+                 "admin_config_rw": False,
+@@ -3784,6 +3786,17 @@ class APIServerAdapter(BasePlatformAdapter):
+         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
+         message_id = f"msg_{uuid.uuid4().hex}"
+         run_id = f"run_{uuid.uuid4().hex}"
++        approval_session_key = run_id
++        created_at = time.time()
++        self._run_approval_sessions[run_id] = approval_session_key
++        self._set_run_status(
++            run_id,
++            "queued",
++            created_at=created_at,
++            session_id=session_id,
++            native_session=True,
++            model=body.get("model", self._model_name),
++        )
+         seq = 0
+ 
+         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+@@ -3820,8 +3833,26 @@ class APIServerAdapter(BasePlatformAdapter):
+                 event_name = event_type.replace("tool.", "tool.")
+                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+ 
++        def _approval_notify(approval_data: Dict[str, Any]) -> None:
++            event = dict(approval_data or {})
++            if "command" in event:
++                from gateway.run import _redact_approval_command
++
++                event["command"] = _redact_approval_command(event.get("command"))
++            event["choices"] = _approval_event_choices(
++                smart_denied=bool(event.get("smart_denied")),
++                allow_permanent=event.get("allow_permanent") is not False,
++            )
++            self._set_run_status(
++                run_id,
++                "waiting_for_approval",
++                last_event="approval.required",
++            )
++            _enqueue("approval.required", event)
++
+         async def _run_and_signal() -> None:
+             try:
++                self._set_run_status(run_id, "running", last_event="run.started")
+                 await queue.put(_event_payload("run.started", {
+                     "user_message": {"role": "user", "content": user_message},
+                     "runtime": runtime_meta,
+@@ -3841,6 +3872,9 @@ class APIServerAdapter(BasePlatformAdapter):
+                     requested_runtime=runtime_request.get("requested") or {},
+                     route_source=runtime_request.get("route_source") or "global",
+                     confirmed_runtime_lock=lock_active,
++                    control_run_id=run_id,
++                    approval_session_key=approval_session_key,
++                    approval_notify=_approval_notify,
+                     **agent_overrides,
+                 )
+                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+@@ -3880,14 +3914,36 @@ class APIServerAdapter(BasePlatformAdapter):
+                     "usage": usage,
+                     "runtime": effective_runtime,
+                 }))
++                self._set_run_status(
++                    run_id,
++                    "completed",
++                    output=final_response,
++                    usage=usage,
++                    last_event="run.completed",
++                )
++            except asyncio.CancelledError:
++                self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
++                await queue.put(_event_payload("run.cancelled", {}))
++                raise
+             except Exception as exc:
+                 logger.exception("[api_server] session chat stream failed")
++                self._set_run_status(
++                    run_id,
++                    "failed",
++                    error=_redact_api_error_text(exc),
++                    last_event="run.failed",
++                )
+                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+             finally:
++                self._active_run_agents.pop(run_id, None)
++                self._active_run_tasks.pop(run_id, None)
++                self._run_approval_sessions.pop(run_id, None)
++                self._stopping_run_ids.discard(run_id)
+                 await queue.put(_event_payload("done", {}))
+                 await queue.put(None)
+ 
+         task = asyncio.create_task(_run_and_signal())
++        self._active_run_tasks[run_id] = task
+         try:
+             self._background_tasks.add(task)
+         except TypeError:
+@@ -6058,6 +6114,9 @@ class APIServerAdapter(BasePlatformAdapter):
+         requested_runtime: Optional[Dict[str, Any]] = None,
+         route_source: str = "global",
+         confirmed_runtime_lock: bool = False,
++        control_run_id: Optional[str] = None,
++        approval_session_key: Optional[str] = None,
++        approval_notify=None,
+     ) -> tuple:
+         """
+         Create an agent and run a conversation in a thread executor.
+@@ -6092,6 +6151,12 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+         def _run():
+             from gateway.session_context import clear_session_vars
++            from tools.approval import (
++                register_gateway_notify,
++                reset_current_session_key,
++                set_current_session_key,
++                unregister_gateway_notify,
++            )
+ 
+             with self._profile_scope(request_profile):
+                 tokens = self._bind_api_server_session(
+@@ -6100,6 +6165,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     session_id=session_id or "",
+                 )
+                 agent = None
++                approval_token = None
+                 try:
+                     agent = self._create_agent(
+                         ephemeral_system_prompt=ephemeral_system_prompt,
+@@ -6118,6 +6184,11 @@ class APIServerAdapter(BasePlatformAdapter):
+                     )
+                     if agent_ref is not None:
+                         agent_ref[0] = agent
++                    if control_run_id:
++                        self._active_run_agents[control_run_id] = agent
++                    if approval_session_key:
++                        approval_token = set_current_session_key(approval_session_key)
++                        register_gateway_notify(approval_session_key, approval_notify)
+                     effective_task_id = session_id or str(uuid.uuid4())
+                     # Baseline for selective background-process reaping on
+                     # SSE client disconnect — mirrors gateway/run.py's
+@@ -6254,6 +6325,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                     )
+                 finally:
++                    if approval_session_key:
++                        unregister_gateway_notify(approval_session_key)
++                    if approval_token is not None:
++                        reset_current_session_key(approval_token)
++                    if control_run_id:
++                        self._active_run_agents.pop(control_run_id, None)
+                     # Turn finished (success, auth failure, or crash) — clear
+                     # ownership markers so a disconnect landing after this
+                     # point can't reap background work this turn left
+diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
+index 05e42c7..dc08d30 100644
+--- a/tests/gateway/test_session_api.py
++++ b/tests/gateway/test_session_api.py
+@@ -63,6 +63,8 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+     assert features["session_resources"] is True
+     assert features["session_chat"] is True
+     assert features["session_chat_streaming"] is True
++    assert features["session_run_control"] is True
++    assert features["session_approval_response"] is True
+     assert features["session_fork"] is True
+     assert features["admin_config_rw"] is False
+     assert features["memory_write_api"] is False
+@@ -194,6 +196,35 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
+     assert any(m.get("tool_calls") for m in messages)
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_chat_stream_registers_native_run_control(adapter, session_db):
++    session_id = session_db.create_session("controlled-session", "api_server")
++    observed = {}
++
++    async def fake_run(**kwargs):
++        observed.update(kwargs)
++        assert kwargs["control_run_id"] in adapter._active_run_tasks
++        assert adapter._run_approval_sessions[kwargs["control_run_id"]] == kwargs["approval_session_key"]
++        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
++
++    app = _create_session_app(adapter)
++    with patch.object(adapter, "_run_agent", side_effect=fake_run):
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                f"/api/sessions/{session_id}/chat/stream",
++                json={"message": "continue"},
++            )
++            assert resp.status == 200
++            await resp.text()
++
++    run_id = observed["control_run_id"]
++    assert observed["approval_session_key"] == run_id
++    assert adapter._run_statuses[run_id]["status"] == "completed"
++    assert adapter._run_statuses[run_id]["native_session"] is True
++    assert run_id not in adapter._active_run_tasks
++    assert run_id not in adapter._run_approval_sessions
++
++
+ # ---------------------------------------------------------------------------
+ # Session-persisted model threading + provider-auth failure surfacing
+ # (salvaged from PR #57947 by @FvanW and PR #59941 by @kaishi00)

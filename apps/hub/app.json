@@ -1,0 +1,9 @@
+{
+  "packageId": "com.honey.hermesg2",
+  "name": "Hermes G2",
+  "version": "0.1.0",
+  "description": "Private glasses-native Hermes client",
+  "entry": "index.html",
+  "permissions": ["microphone", "network"]
+}
+

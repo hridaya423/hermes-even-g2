@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-g2.local/schema/protocol-v1.json",
+  "title": "Hermes G2 protocol v1",
+  "type": "object",
+  "required": ["protocolVersion"],
+  "properties": {"protocolVersion": {"const": "1.0"}},
+  "$defs": {
+    "action": {
+      "type": "object",
+      "required": ["kind", "deviceId", "idempotencyKey", "createdAt", "payload"],
+      "properties": {
+        "kind": {"enum": ["createSession", "forkSession", "prompt", "queuePrompt", "stopRun", "approveOnce", "approveSession", "approveAlways", "deny", "pinSession", "unpinSession", "runJob", "pauseJob", "resumeJob", "acknowledge"]},
+        "deviceId": {"type": "string", "minLength": 1},
+        "idempotencyKey": {"type": "string", "minLength": 8},
+        "sessionId": {"type": "string"},
+        "runId": {"type": "string"},
+        "expectedState": {"type": "string"},
+        "createdAt": {"type": "string", "format": "date-time"},
+        "payload": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
