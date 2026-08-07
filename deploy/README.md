@@ -4,7 +4,7 @@ The boot path uses LaunchDaemons because core Hermes chat must work without an A
 
 1. Pin and patch the Mac mini Hermes checkout, then run `tests/gateway/test_session_api.py`.
 2. Set `API_SERVER_KEY` in Hermes's root-owned environment and install the Hermes LaunchDaemon.
-3. Run `sudo scripts/install-mac-mini.sh`; on its first pass it creates `/etc/hermes-g2/bridge.env` with mode `0600` and stops for secret editing.
+3. Run `sudo scripts/install-mac-mini.sh`. When the verified user-tier deployment exists, it promotes that environment, SQLite device/event state, Whisper model and summary helper into root-owned locations without printing or rotating credentials. Without a staged deployment it creates `/etc/hermes-g2/bridge.env` with mode `0600` and stops for secret editing.
 4. Install `whisper.cpp`, then run `scripts/install-whisper-model.sh`. The selected `tiny.en-q5_1` model transcribed the deployment fixture correctly in 0.58 seconds on the Mac mini; the script verifies the published SHA-256 before installation.
 5. Run `sudo scripts/configure-tailscale.sh`, confirm the MagicDNS HTTPS origin, and generate separate `android`, `hub`, and `simulator` pairing codes.
 6. Run `scripts/install-hermes-plugin.sh`. It stages the observer and its independent secret but deliberately does not restart Hermes; restart only after any in-progress Hermes repair is complete.
