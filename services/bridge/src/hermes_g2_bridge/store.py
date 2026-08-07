@@ -215,3 +215,29 @@ class Store:
             await db.execute("INSERT INTO observed_sessions VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET upstream_updated_at=excluded.upstream_updated_at", (session_id, updated_at))
             await db.commit()
             return True
+
+    async def enqueue_prompt(self, session_id: str, item: dict[str, Any]) -> int:
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
+            queue = json.loads(row["queued_prompts_json"]) if row else []
+            queue.append(item)
+            await db.execute(
+                "INSERT INTO session_state(session_id,queued_prompts_json,updated_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET queued_prompts_json=excluded.queued_prompts_json,updated_at=excluded.updated_at",
+                (session_id, json.dumps(queue), utc_now().isoformat()),
+            )
+            await db.commit()
+            return len(queue)
+
+    async def dequeue_prompt(self, session_id: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
+            queue = json.loads(row["queued_prompts_json"]) if row else []
+            if not queue:
+                await db.rollback()
+                return None
+            item = queue.pop(0)
+            await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
+            await db.commit()
+            return item

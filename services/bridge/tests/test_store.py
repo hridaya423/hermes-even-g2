@@ -39,3 +39,12 @@ async def test_idempotency_rejects_body_mismatch(store):
     assert not fresh and cached == {"ok": True}
     with pytest.raises(ValueError):
         await store.idempotency_begin("d", "same-key", b"two")
+
+
+async def test_prompt_queue_survives_store_reopen(store):
+    assert await store.enqueue_prompt("session", {"text": "first"}) == 1
+    assert await store.enqueue_prompt("session", {"text": "second"}) == 2
+    reopened = Store(store.path)
+    assert await reopened.dequeue_prompt("session") == {"text": "first"}
+    assert await reopened.dequeue_prompt("session") == {"text": "second"}
+    assert await reopened.dequeue_prompt("session") is None

@@ -34,12 +34,17 @@ class ControlService:
 
     async def reconcile_once(self) -> int:
         changed = 0
-        for session in await self.hermes.list_sessions(limit=100):
+        sessions = await self.hermes.list_sessions(limit=100)
+        for session in sessions:
             session_id = str(session.get("id", session.get("session_id", "")))
             updated_at = str(session.get("updated_at", session.get("updatedAt", "")))
             if session_id and await self.store.observe_session(session_id, updated_at):
                 await self.store.append_event(EventInput(kind="session.updated", source="hermes", sessionId=session_id, payload=session))
                 changed += 1
+            if session_id and session.get("state") == "idle":
+                queued = await self.store.dequeue_prompt(session_id)
+                if queued:
+                    self._start_prompt(session_id, queued["text"], queued["deviceId"], queued.get("options"))
         return changed
 
     def require_core(self) -> None:
@@ -87,16 +92,26 @@ class ControlService:
             text = str(action.payload.get("text", "")).strip()
             if not text:
                 raise ValueError("prompt text is empty")
-            task = asyncio.create_task(self._run_prompt(action.session_id, text, device["id"], action.payload.get("options")))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
-            return {"status": "queued", "sessionId": action.session_id}
+            sessions = await self.hermes.list_sessions(limit=100)
+            target = next((item for item in sessions if item["id"] == action.session_id), None)
+            should_queue = kind == ActionKind.QUEUE_PROMPT or target is None or target.get("state") in {"busy", "queued"}
+            if should_queue:
+                position = await self.store.enqueue_prompt(action.session_id, {"text": text, "deviceId": device["id"], "options": action.payload.get("options"), "createdAt": action.created_at.isoformat()})
+                await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload={"state": "queued", "queuePosition": position}))
+                return {"status": "queued", "sessionId": action.session_id, "position": position}
+            self._start_prompt(action.session_id, text, device["id"], action.payload.get("options"))
+            return {"status": "started", "sessionId": action.session_id}
         if kind in {ActionKind.RUN_JOB, ActionKind.PAUSE_JOB, ActionKind.RESUME_JOB}:
             if not self.capabilities.get("jobs"):
                 raise ValueError("installed Hermes does not advertise jobs")
             verb = {ActionKind.RUN_JOB: "run", ActionKind.PAUSE_JOB: "pause", ActionKind.RESUME_JOB: "resume"}[kind]
             return await self.hermes.job_action(str(action.payload["jobId"]), verb)
         raise ValueError(f"unsupported action {kind}")
+
+    def _start_prompt(self, session_id: str, text: str, device_id: str, options: dict | None) -> None:
+        task = asyncio.create_task(self._run_prompt(session_id, text, device_id, options))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _run_prompt(self, session_id: str, text: str, device_id: str, options: dict | None) -> None:
         run_id = None
