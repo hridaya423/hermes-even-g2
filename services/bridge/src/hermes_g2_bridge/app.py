@@ -16,7 +16,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 
 from .config import Settings
-from .hermes import HermesClient
+from .hermes import HermesClient, HermesError
 from .models import AgentAction, EventInput, PairingExchange, utc_now
 from .security import authenticate_websocket, redact, require_scope, verify_plugin
 from .service import ControlService
@@ -47,7 +47,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings()
     store = Store(config.database_path)
     hermes = HermesClient(config.hermes_origin, config.hermes_api_key.get_secret_value())
-    service = ControlService(store, hermes, config.action_max_age_seconds)
+    service = ControlService(
+        store,
+        hermes,
+        config.action_max_age_seconds,
+        config.summary_helper,
+        config.whisper_binary,
+        config.whisper_model,
+        config.tailscale_cli,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -92,18 +100,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/snapshot")
     async def snapshot(device=Depends(require_scope("sessions:read"))):
-        probe, sessions = await asyncio.gather(service.probe(), hermes.list_sessions())
+        probe, sessions = await asyncio.gather(service.probe(), service.sessions())
         async with store.connect() as db:
             active = [dict(row) for row in await db.execute_fetchall("SELECT * FROM run_correlation WHERE status NOT IN ('completed','failed','cancelled')")]
             cursor_row = await (await db.execute("SELECT COALESCE(MAX(cursor),0) AS cursor FROM events")).fetchone()
             approval_rows = await db.execute_fetchall("SELECT run_id,payload_json FROM events WHERE kind='approval.required' ORDER BY cursor DESC LIMIT 100")
-            resolved = {row["run_id"] for row in await db.execute_fetchall("SELECT run_id FROM events WHERE kind='approval.resolved'")}
-        pending = [json.loads(row["payload_json"]) for row in approval_rows if row["run_id"] not in resolved]
+            resolved_rows = await db.execute_fetchall("SELECT run_id,payload_json FROM events WHERE kind='approval.resolved'")
+        resolved = {
+            (row["run_id"], json.loads(row["payload_json"]).get("requestId"))
+            for row in resolved_rows
+        }
+        pending = []
+        seen = set()
+        for row in approval_rows:
+            payload = json.loads(row["payload_json"])
+            key = (row["run_id"], payload.get("requestId"))
+            if key not in resolved and key not in seen:
+                pending.append(payload)
+                seen.add(key)
         return {"protocolVersion": "1.0", **probe, "sessions": sessions, "activeRuns": active, "pendingApprovals": pending, "cursor": cursor_row["cursor"]}
 
     @app.get("/v1/sessions")
     async def sessions(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0), device=Depends(require_scope("sessions:read"))):
-        return await hermes.list_sessions(limit, offset)
+        return await service.sessions(limit, offset)
 
     @app.get("/v1/sessions/{session_id}/messages")
     async def messages(session_id: str, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0), device=Depends(require_scope("sessions:read"))):
@@ -151,10 +170,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def actions(action: AgentAction, request: Request, device=Depends(require_scope("sessions:write"))):
         body = await request.body()
         try:
-            fresh, cached = await store.idempotency_begin(device["id"], action.idempotency_key, body)
+            fresh, cached_status, cached = await store.idempotency_begin(
+                device["id"], action.idempotency_key, body
+            )
             if not fresh:
                 if cached is None:
                     raise HTTPException(409, "matching action is still in progress")
+                if cached_status and cached_status >= 400:
+                    raise HTTPException(cached_status, cached.get("detail", "action failed"))
                 return cached
             response = await service.execute(action, device)
             await store.idempotency_finish(device["id"], action.idempotency_key, 200, response)
@@ -163,8 +186,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except HTTPException:
             raise
         except ValueError as error:
+            await store.idempotency_finish(
+                device["id"], action.idempotency_key, 409, {"detail": str(error)}
+            )
             await store.audit(device["id"], action.kind, action.session_id, action.run_id, "rejected", {"reason": str(error)[:160]})
             raise HTTPException(409, str(error)) from error
+        except HermesError as error:
+            status = 409 if error.status_code in {400, 409} else 502
+            await store.idempotency_finish(
+                device["id"], action.idempotency_key, status, {"detail": str(error)}
+            )
+            await store.audit(
+                device["id"], action.kind, action.session_id, action.run_id, "failed",
+                {"reason": str(error)[:160]},
+            )
+            raise HTTPException(status, str(error)) from error
 
     @app.post("/v1/audio")
     async def audio(request: Request, session_id: str = Query(alias="sessionId"), device=Depends(require_scope("audio:write"))):

@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
-    <application android:theme="@style/AppTheme" android:label="Hermes G2" android:allowBackup="false" android:usesCleartextTraffic="false">
+    <application android:name=".HermesApplication" android:theme="@style/AppTheme" android:label="Hermes G2" android:allowBackup="false" android:usesCleartextTraffic="false">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/>
@@ -17,4 +17,3 @@
         </receiver>
     </application>
 </manifest>
-

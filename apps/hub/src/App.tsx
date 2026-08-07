@@ -1,11 +1,11 @@
 import {useEffect, useMemo, useRef, useState} from "react";
 import {CreateStartUpPageContainer, RebuildPageContainer, TextContainerProperty, waitForEvenAppBridge} from "@evenrealities/even_hub_sdk";
-import type {AgentAction, ApprovalChoice, ApprovalRequest, DurableEvent, SessionSummary} from "@hermes-g2/protocol";
+import type {AgentAction, AgentMessage, ApprovalChoice, ApprovalRequest, DurableEvent, SessionSummary} from "@hermes-g2/protocol";
 import {BridgeApi, loadCredentials, saveCredentials, type Credentials} from "./api";
 import {beginRecording, bindTranscript, cycleSession, visibleSession, type ViewState} from "./state";
 
 type GlassBridge = Awaited<ReturnType<typeof waitForEvenAppBridge>>;
-const initial: ViewState = {sessions: [], selected: 0, mode: "default", detailPage: 0, decisionIndex: 0, connected: false, cursor: Number(localStorage.getItem("hermes-g2.cursor") ?? 0), pending: [], latestEvents: {}};
+const initial: ViewState = {sessions: [], selected: 0, mode: "default", detailPage: 0, decisionIndex: 0, connected: false, cursor: Number(localStorage.getItem("hermes-g2.cursor") ?? 0), pending: [], latestEvents: {}, history: {}};
 
 export default function App() {
   const [credentials, setCredentials] = useState<Credentials | undefined>(loadCredentials());
@@ -25,12 +25,23 @@ export default function App() {
     void api.snapshot().then((snapshot) => {
       const sessions = Array.isArray(snapshot.sessions) ? snapshot.sessions : snapshot.sessions.items ?? [];
       const selectedId = localStorage.getItem("hermes-g2.selected");
-      const selected = Math.max(0, sessions.findIndex((item) => item.id === selectedId));
-      setState((value) => ({...value, sessions: orderSessions(sessions).slice(0, 10), selected, cursor: snapshot.cursor, connected: true}));
+      const carousel = [...orderSessions(sessions).slice(0, 9), newSessionRow()];
+      setState((value) => ({...value, sessions: carousel, selected: Math.max(0, carousel.findIndex((item) => item.id === selectedId)), cursor: snapshot.cursor, pending: snapshot.pendingApprovals ?? [], connected: true}));
       stop = api.channel(snapshot.cursor, receiveEvent, (connected) => setState((value) => ({...value, connected})));
     }).catch((error) => setState((value) => ({...value, notice: String(error), connected: false})));
     return () => stop();
   }, [api]);
+
+  useEffect(() => {
+    if (!api || !session?.id || session.id === "__new__" || state.history[session.id]) return;
+    let cancelled = false;
+    void api.messages(session.id).then((page) => {
+      if (!cancelled) setState((value) => ({...value, history: {...value.history, [session.id]: page.data}}));
+    }).catch((error) => {
+      if (!cancelled) setState((value) => ({...value, notice: `HISTORY: ${String(error)}`}));
+    });
+    return () => { cancelled = true; };
+  }, [api, session?.id, state.history]);
 
   useEffect(() => {
     if (!isEvenHost()) return;
@@ -78,6 +89,7 @@ export default function App() {
   async function press(): Promise<void> {
     const current = stateRef.current;
     if (!api || !session) return;
+    if (session.id === "__new__") return createSession();
     if (current.mode === "approval") return setState((value) => ({...value, mode: "confirmation"}));
     if (current.mode === "confirmation" && approval) return sendApproval(approval, approval.choices[current.decisionIndex]);
     if (approval) return setState((value) => ({...value, mode: "approval", decisionIndex: 0}));
@@ -106,6 +118,20 @@ export default function App() {
     catch (error) { setState((value) => ({...value, notice: String(error)})); }
   }
 
+  async function createSession(): Promise<void> {
+    if (!api || !credentials) return;
+    try {
+      const created = await api.action({kind: "createSession", deviceId: credentials.deviceId, idempotencyKey: crypto.randomUUID(), createdAt: new Date().toISOString(), payload: {title: "G2 session"}}) as {id?: string; session_id?: string};
+      const snapshot = await api.snapshot();
+      const sessions = Array.isArray(snapshot.sessions) ? snapshot.sessions : snapshot.sessions.items ?? [];
+      const createdId = created.id ?? created.session_id;
+      const carousel = [...orderSessions(sessions).slice(0, 9), newSessionRow()];
+      setState((value) => ({...value, sessions: carousel, selected: Math.max(0, carousel.findIndex((item) => item.id === createdId)), notice: "SESSION CREATED"}));
+    } catch (error) {
+      setState((value) => ({...value, notice: String(error)}));
+    }
+  }
+
   async function sendApproval(request: ApprovalRequest, choice?: ApprovalChoice): Promise<void> {
     if (!api || !credentials || !choice) return;
     const kind = {once: "approveOnce", session: "approveSession", always: "approveAlways", deny: "deny"}[choice] as AgentAction["kind"];
@@ -127,16 +153,18 @@ function Body({state, session, approval, latest}: {state: ViewState; session?: S
   if (approval) { const choice = approval.choices[state.decisionIndex]; return <section className="body"><label>ACTION REQUIRED · {approval.tool}</label><p>{approval.command ?? approval.destination ?? "Hermes requests permission to continue."}</p><ul>{approval.choices.map((item, index) => <li className={index === state.decisionIndex ? "selected" : ""} key={item}>{index === state.decisionIndex ? "■" : "□"} {item.toUpperCase()}</li>)}</ul><strong>{state.mode === "confirmation" ? `PRESS AGAIN TO CONFIRM ${choice?.toUpperCase()}` : "SWIPE CHOICE · PRESS SELECT"}</strong></section>; }
   if (state.mode === "detail") return <Detail state={state} session={session}/>;
   if (state.mode === "recording") return <section className="body"><label>LISTENING</label><p>Recording for {session?.title}. The destination is now locked.</p><strong>PRESS TO STOP · 45 SECOND MAX</strong></section>;
-  return <section className="body"><label>{session?.state === "busy" ? "CURRENT CHECKPOINT" : latest?.kind?.toUpperCase() ?? "LATEST ANSWER"}</label><p>{summary(latest, session)}</p><aside>{session?.executionReady ? "EXECUTION READY" : "UNBOUND · WORKSPACE TOOLS BLOCKED"}</aside><strong>PRESS TO SPEAK · DOUBLE PRESS DETAIL</strong></section>;
+  return <section className="body"><label>{session?.state === "busy" ? "CURRENT CHECKPOINT" : latest?.kind?.toUpperCase() ?? "LATEST ANSWER"}</label><p>{summary(latest, session, session ? state.history[session.id] : undefined)}</p><aside>{session?.executionReady ? "EXECUTION READY" : "UNBOUND · WORKSPACE TOOLS BLOCKED"}</aside><strong>PRESS TO SPEAK · DOUBLE PRESS DETAIL</strong></section>;
 }
-function Detail({state, session}: {state: ViewState; session?: SessionSummary}) { const events = session ? state.latestEvents[session.id] ?? [] : []; const pages = [{title: "FULL ANSWER", text: [...events].reverse().find((event) => event.kind === "message.completed")?.payload}, {title: "TOOLS", text: events.filter((event) => event.kind.startsWith("tool.")).slice(-6).map((event) => event.payload)}, {title: "SUBAGENTS", text: events.filter((event) => event.kind.startsWith("subagent.")).slice(-6).map((event) => event.payload)}, {title: "PROVENANCE", text: session}]; const page = pages[state.detailPage]; return <section className="body detail"><label>{page.title} · {state.detailPage + 1}/4</label><pre>{format(page.text)}</pre><strong>SWIPE PAGES · DOUBLE PRESS BACK</strong></section>; }
-function Pairing({onSave}: {onSave: (credentials: Credentials) => void}) { const [origin, setOrigin] = useState("https://mac-mini.tailnet.ts.net/hermes-g2"); const [deviceId, setDevice] = useState(""); const [credential, setCredential] = useState(""); return <main className="pairing"><h1>Hermes G2</h1><p>Enter the scoped Hub credential from the Android pairing flow. The Hermes master key never belongs here.</p><input aria-label="Bridge origin" value={origin} onChange={(event) => setOrigin(event.target.value.replace(/\/$/, ""))}/><input aria-label="Device ID" placeholder="Device ID" value={deviceId} onChange={(event) => setDevice(event.target.value)}/><input aria-label="Device credential" type="password" placeholder="Device credential" value={credential} onChange={(event) => setCredential(event.target.value)}/><button disabled={!origin || !deviceId || !credential} onClick={() => onSave({origin, deviceId, credential})}>Connect private bridge</button></main>; }
+function Detail({state, session}: {state: ViewState; session?: SessionSummary}) { const events = session ? state.latestEvents[session.id] ?? [] : []; const history = session ? state.history[session.id] ?? [] : []; const pages = [{title: "FULL ANSWER", text: latestAssistant(history)?.content ?? [...events].reverse().find((event) => event.kind === "message.completed")?.payload}, {title: "TOOLS", text: events.filter((event) => event.kind.startsWith("tool.")).slice(-6).map((event) => event.payload)}, {title: "SUBAGENTS", text: events.filter((event) => event.kind.startsWith("subagent.")).slice(-6).map((event) => event.payload)}, {title: "PROVENANCE", text: session}]; const page = pages[state.detailPage]; return <section className="body detail"><label>{page.title} · {state.detailPage + 1}/4</label><pre>{format(page.text)}</pre><strong>SWIPE PAGES · DOUBLE PRESS BACK</strong></section>; }
+function Pairing({onSave}: {onSave: (credentials: Credentials) => void}) { const [origin, setOrigin] = useState("https://hridyas-mini.tail59dec9.ts.net/hermes-g2"); const [code, setCode] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const pair = async () => { setBusy(true); setError(""); try { onSave(await BridgeApi.exchange(origin, code)); } catch (value) { setError(String(value)); setBusy(false); } }; return <main className="pairing"><h1>Hermes G2</h1><p>Enter the 90-second, single-use Hub code from the Mac mini. The bridge issues this G2 its own revocable credential; the Hermes master key never enters the app.</p><input aria-label="Bridge origin" value={origin} onChange={(event) => setOrigin(event.target.value.replace(/\/$/, ""))}/><input aria-label="Pairing code" inputMode="numeric" placeholder="6-digit pairing code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}/>{error && <p role="alert">{error}</p>}<button disabled={busy || !origin.startsWith("https://") || code.length !== 6} onClick={() => void pair()}>{busy ? "Pairing…" : "Pair private G2"}</button></main>; }
 
-function renderGlass(state: ViewState) { const session = visibleSession(state); const approval = state.pending.find((item) => item.sessionId === session?.id); const latest = session ? state.latestEvents[session.id]?.at(-1) : undefined; const header = session ? `HERMES  ${session.title.slice(0, 24)}  ${shortId(session.id)}  ${state.connected ? "●" : "○"}` : "HERMES  NO SESSION"; let body = summary(latest, session); if (state.mode === "recording") body = `LISTENING\n\nDestination locked: ${session?.title}\n${shortId(state.recordingSessionId ?? "")}`; if (state.transcript) body = `CONFIRM DESTINATION\n${session?.title} · ${shortId(state.transcript.sessionId)}\n\n${state.transcript.text}\n\nPRESS SEND · ↓ CANCEL · ↑ AGAIN`; if (approval) body = `APPROVAL · ${approval.tool}\n${approval.command ?? approval.destination ?? "Action requires permission"}\n\n${approval.choices.map((choice, index) => `${index === state.decisionIndex ? "■" : "□"} ${choice.toUpperCase()}`).join("   ")}\n\n${state.mode === "confirmation" ? "PRESS AGAIN TO CONFIRM" : "SWIPE · PRESS SELECT"}`; const item = (id: number, name: string, y: number, height: number, content: string, capture = 0) => new TextContainerProperty({containerID: id, containerName: name, xPosition: 12, yPosition: y, width: 552, height, borderWidth: 0, borderColor: 15, borderRadius: 0, paddingLength: 2, content, isEventCapture: capture}); return {containerTotalNum: 3, textObject: [item(1, "header", 8, 34, header), item(2, "body", 50, 180, body, 1), item(3, "footer", 238, 38, `${state.selected + 1}/${Math.max(1, state.sessions.length)}   ${state.pending.length} PENDING   ${state.notice ?? session?.state.toUpperCase() ?? "OFFLINE"}`)]}; }
-function summary(event?: DurableEvent, session?: SessionSummary): string { const payload = event?.payload as Record<string, unknown> | string | undefined; if (typeof payload === "string") return payload.slice(0, 600); return String(payload?.summary ?? payload?.message ?? payload?.content ?? session?.latestAnswer ?? (session ? "Press to speak a continuation into this exact session." : "Pair the private bridge to begin.")); }
+function renderGlass(state: ViewState) { const session = visibleSession(state); const approval = state.pending.find((item) => item.sessionId === session?.id); const latest = session ? state.latestEvents[session.id]?.at(-1) : undefined; const header = session ? `HERMES  ${session.title.slice(0, 24)}  ${shortId(session.id)}  ${state.connected ? "●" : "○"}` : "HERMES  NO SESSION"; let body = summary(latest, session, session ? state.history[session.id] : undefined); if (state.mode === "recording") body = `LISTENING\n\nDestination locked: ${session?.title}\n${shortId(state.recordingSessionId ?? "")}`; if (state.transcript) body = `CONFIRM DESTINATION\n${session?.title} · ${shortId(state.transcript.sessionId)}\n\n${state.transcript.text}\n\nPRESS SEND · ↓ CANCEL · ↑ AGAIN`; if (approval) body = `APPROVAL · ${approval.tool}\n${approval.command ?? approval.destination ?? "Action requires permission"}\n\n${approval.choices.map((choice, index) => `${index === state.decisionIndex ? "■" : "□"} ${choice.toUpperCase()}`).join("   ")}\n\n${state.mode === "confirmation" ? "PRESS AGAIN TO CONFIRM" : "SWIPE · PRESS SELECT"}`; const item = (id: number, name: string, y: number, height: number, content: string, capture = 0) => new TextContainerProperty({containerID: id, containerName: name, xPosition: 12, yPosition: y, width: 552, height, borderWidth: 0, borderColor: 15, borderRadius: 0, paddingLength: 2, content, isEventCapture: capture}); return {containerTotalNum: 3, textObject: [item(1, "header", 8, 34, header), item(2, "body", 50, 180, body, 1), item(3, "footer", 238, 38, `${state.selected + 1}/${Math.max(1, state.sessions.length)}   ${state.pending.length} PENDING   ${state.notice ?? session?.state.toUpperCase() ?? "OFFLINE"}`)]}; }
+function summary(event?: DurableEvent, session?: SessionSummary, history?: AgentMessage[]): string { if (session?.id === "__new__") return "Press to create a fresh Hermes session owned by Even G2."; const payload = event?.payload as Record<string, unknown> | string | undefined; if (typeof payload === "string") return payload.slice(0, 600); return String(payload?.summary ?? payload?.message ?? payload?.content ?? latestAssistant(history)?.content ?? session?.latestAnswer ?? (session ? "Press to speak a continuation into this exact session." : "Pair the private bridge to begin.")); }
+function latestAssistant(history?: AgentMessage[]): AgentMessage | undefined { return history?.find((message) => message.role === "assistant" && message.content.trim()); }
 function format(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value ?? "No activity yet.", null, 2); }
 function shortId(value: string): string { return value.length > 12 ? `${value.slice(0, 5)}…${value.slice(-4)}` : value; }
 function concat(chunks: Uint8Array[]): Uint8Array { const output = new Uint8Array(chunks.reduce((sum, item) => sum + item.length, 0)); let offset = 0; for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; } return output; }
 function orderSessions(items: SessionSummary[]): SessionSummary[] { return [...items].sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt)); }
+function newSessionRow(): SessionSummary { return {id: "__new__", title: "NEW G2 SESSION", source: "even_g2", executionReady: true, state: "idle", updatedAt: "", pinned: false}; }
 function upsertApproval(items: ApprovalRequest[], incoming: ApprovalRequest): ApprovalRequest[] { return [incoming, ...items.filter((item) => item.requestId !== incoming.requestId)]; }
 function isEvenHost(): boolean { return Boolean((window as any).flutter_inappwebview || (window as any).evenAppBridge || /EvenApp/i.test(navigator.userAgent)); }

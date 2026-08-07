@@ -7,7 +7,9 @@ import httpx
 
 
 class HermesError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class HermesClient:
@@ -20,9 +22,15 @@ class HermesClient:
         await self.client.aclose()
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
-        response = await self.client.request(method, path, **kwargs)
+        try:
+            response = await self.client.request(method, path, **kwargs)
+        except httpx.HTTPError as error:
+            raise HermesError(f"Hermes {method} {path} is unreachable", 503) from error
         if response.is_error:
-            raise HermesError(f"Hermes {method} {path} returned {response.status_code}: {response.text[:300]}")
+            raise HermesError(
+                f"Hermes {method} {path} returned {response.status_code}: {response.text[:300]}",
+                response.status_code,
+            )
         return response.json()
 
     async def probe(self) -> dict[str, Any]:
@@ -48,7 +56,7 @@ class HermesClient:
 
     async def list_sessions(self, limit: int = 50, offset: int = 0) -> Any:
         value = await self._request("GET", "/api/sessions", params={"limit": limit, "offset": offset})
-        rows = value.get("sessions", value.get("items", [])) if isinstance(value, dict) else value
+        rows = value.get("data", value.get("sessions", value.get("items", []))) if isinstance(value, dict) else value
         return [self._normalize_session(item) for item in rows]
 
     @staticmethod
@@ -67,19 +75,52 @@ class HermesClient:
             "workspace": workspace,
             "executionReady": state != "unbound",
             "state": state,
-            "updatedAt": str(value.get("updated_at") or value.get("updatedAt") or ""),
+            "updatedAt": str(value.get("updated_at") or value.get("updatedAt") or value.get("last_active") or ""),
             "pinned": bool(value.get("pinned", False)),
             "latestAnswer": value.get("latest_answer") or value.get("latestAnswer"),
         }
 
     async def messages(self, session_id: str, limit: int = 100, offset: int = 0) -> Any:
-        return await self._request("GET", f"/api/sessions/{session_id}/messages", params={"limit": limit, "offset": offset})
+        value = await self._request("GET", f"/api/sessions/{session_id}/messages")
+        rows = value.get("data", value.get("messages", [])) if isinstance(value, dict) else value
+        normalized = [self._normalize_message(item, session_id) for item in reversed(rows)]
+        return {
+            "object": "list",
+            "data": normalized[offset:offset + limit],
+            "limit": limit,
+            "offset": offset,
+            "total": len(normalized),
+            "hasMore": offset + limit < len(normalized),
+            "order": "newest",
+        }
+
+    @staticmethod
+    def _normalize_message(value: dict[str, Any], session_id: str) -> dict[str, Any]:
+        role = str(value.get("role") or "assistant")
+        if role not in {"user", "assistant", "tool", "system"}:
+            role = "assistant"
+        return {
+            "id": str(value.get("id") or ""),
+            "sessionId": str(value.get("session_id") or session_id),
+            "role": role,
+            "content": str(value.get("content") or ""),
+            "reasoning": value.get("reasoning") or value.get("reasoning_content"),
+            "timestamp": value.get("timestamp"),
+            "finishReason": value.get("finish_reason"),
+            "toolName": value.get("tool_name"),
+            "toolCalls": value.get("tool_calls"),
+            "tokenCount": value.get("token_count"),
+        }
 
     async def create_session(self, payload: dict[str, Any]) -> Any:
-        return await self._request("POST", "/api/sessions", json={**payload, "source": "even_g2"})
+        value = await self._request("POST", "/api/sessions", json={**payload, "source": "even_g2"})
+        session = value.get("session", value) if isinstance(value, dict) else value
+        return self._normalize_session(session)
 
     async def fork_session(self, session_id: str, payload: dict[str, Any]) -> Any:
-        return await self._request("POST", f"/api/sessions/{session_id}/fork", json=payload)
+        value = await self._request("POST", f"/api/sessions/{session_id}/fork", json=payload)
+        session = value.get("session", value) if isinstance(value, dict) else value
+        return self._normalize_session(session)
 
     async def stream_prompt(self, session_id: str, text: str, options: dict[str, Any] | None = None) -> AsyncIterator[dict[str, Any]]:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -89,13 +130,25 @@ class HermesClient:
                     body = (await response.aread()).decode(errors="replace")
                     raise HermesError(f"session stream failed with {response.status_code}: {body[:300]}")
                 data_lines: list[str] = []
+                event_name: str | None = None
                 async for line in response.aiter_lines():
-                    if line.startswith("data:"):
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
                         data_lines.append(line[5:].lstrip())
                     elif not line and data_lines:
                         raw = "\n".join(data_lines)
                         data_lines.clear()
-                        yield json.loads(raw)
+                        payload = json.loads(raw)
+                        if event_name and "type" not in payload and "event" not in payload:
+                            payload["type"] = event_name
+                        event_name = None
+                        yield payload
+                if data_lines:
+                    payload = json.loads("\n".join(data_lines))
+                    if event_name and "type" not in payload and "event" not in payload:
+                        payload["type"] = event_name
+                    yield payload
 
     async def stop_run(self, session_id: str, run_id: str) -> Any:
         return await self._request("POST", f"/v1/runs/{run_id}/stop", json={"session_id": session_id})

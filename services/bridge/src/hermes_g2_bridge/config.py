@@ -20,5 +20,7 @@ class Settings(BaseSettings):
     event_retention_floor: int = 10_000
     plugin_secret: SecretStr | None = None
     whisper_binary: Path = Path("/opt/homebrew/bin/whisper-cli")
-    whisper_model: Path = Path("/var/lib/hermes-g2/models/ggml-base.en-q5_1.bin")
+    whisper_model: Path = Path("/var/lib/hermes-g2/models/ggml-tiny.en-q5_1.bin")
+    summary_helper: Path = Path("/usr/local/libexec/hermes-g2-summary")
+    tailscale_cli: Path = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
     diagnostics_audio: bool = False

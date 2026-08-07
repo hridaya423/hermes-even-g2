@@ -2,17 +2,24 @@
 set -euo pipefail
 project_dir=${0:A:h:h}
 
-cd "$project_dir/services/bridge"
-uv run pytest
-uv run ruff check src tests
 cd "$project_dir"
+PYTHONPATH=packages/hermes-plugin services/bridge/.venv/bin/ruff check packages/hermes-plugin services/bridge
+PYTHONPATH=packages/hermes-plugin services/bridge/.venv/bin/pytest packages/hermes-plugin/tests services/bridge/tests
+npm run typecheck
 npm run build
 npm test
 cd "$project_dir/apps/android"
-JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ANDROID_HOME="$HOME/Library/Android/sdk" ./gradlew assembleDebug testDebugUnitTest
-git apply --check "$project_dir/patches/hermes-session-run-control.patch" --directory=/path/to/hermes-agent || true
+JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ANDROID_HOME="$HOME/Library/Android/sdk" ./gradlew --no-daemon assembleDebug testDebugUnitTest
+swift build -c release --package-path "$project_dir/services/apple-summary-helper"
+zsh -n "$project_dir"/scripts/*.sh
+git -C "$project_dir" diff --check
+
+if [[ -n ${HERMES_AGENT_CHECKOUT:-} ]]; then
+  if ! git -C "$HERMES_AGENT_CHECKOUT" apply --check "$project_dir/patches/hermes-session-run-control.patch" 2>/dev/null; then
+    git -C "$HERMES_AGENT_CHECKOUT" apply --reverse --check "$project_dir/patches/hermes-session-run-control.patch"
+  fi
+fi
 
 test -s "$project_dir/apps/hub/HermesG2.ehpk"
 test -s "$project_dir/apps/android/app/build/outputs/apk/debug/app-debug.apk"
 print "Local release artifacts verified. Physical G2, Doze, reboot and Mac-mini power-cycle acceptance remain deployment tests."
-

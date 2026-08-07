@@ -1,11 +1,11 @@
-import type { ApprovalRequest, DurableEvent, SessionSummary } from "@hermes-g2/protocol";
+import type { AgentMessage, ApprovalRequest, DurableEvent, SessionSummary } from "@hermes-g2/protocol";
 
 export type Mode = "default" | "detail" | "recording" | "transcript" | "approval" | "confirmation";
 export type Transcript = {text: string; duration: number; confidence?: number | null; sessionId: string};
 export type ViewState = {
   sessions: SessionSummary[]; selected: number; mode: Mode; detailPage: number; decisionIndex: number;
   connected: boolean; cursor: number; pending: ApprovalRequest[]; transcript?: Transcript; recordingSessionId?: string;
-  latestEvents: Record<string, DurableEvent[]>; notice?: string;
+  latestEvents: Record<string, DurableEvent[]>; history: Record<string, AgentMessage[]>; notice?: string;
 };
 
 export function visibleSession(state: ViewState): SessionSummary | undefined { return state.sessions[state.selected]; }
@@ -21,4 +21,3 @@ export function bindTranscript(state: ViewState, transcript: Transcript): ViewSt
   if (transcript.sessionId !== state.recordingSessionId) throw new Error("transcript destination changed while recording");
   return {...state, mode: "transcript", transcript};
 }
-

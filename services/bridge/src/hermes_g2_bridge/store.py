@@ -54,7 +54,13 @@ MIGRATIONS = [
       action TEXT NOT NULL, session_fingerprint TEXT, run_fingerprint TEXT,
       outcome TEXT NOT NULL, detail_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS summary_cache(
+      content_hash TEXT PRIMARY KEY, summary_json TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    """,
     """
+    ALTER TABLE session_state ADD COLUMN source_override TEXT;
+    """,
 ]
 
 
@@ -85,9 +91,31 @@ class Store:
     async def migrate(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with self.connect() as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY)"
+            )
+            applied = {
+                row["version"]
+                for row in await db.execute_fetchall("SELECT version FROM schema_migrations")
+            }
             for index, sql in enumerate(MIGRATIONS, start=1):
+                if index in applied:
+                    continue
+                if index == 2:
+                    columns = {
+                        row["name"]
+                        for row in await db.execute_fetchall("PRAGMA table_info(session_state)")
+                    }
+                    if "source_override" in columns:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)",
+                            (index,),
+                        )
+                        continue
                 await db.executescript(sql)
-                await db.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", (index,))
+                await db.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", (index,)
+                )
             await db.commit()
 
     async def create_pairing(self, kind: str, ttl_seconds: int) -> str:
@@ -167,7 +195,9 @@ class Store:
                 except TimeoutError:
                     yield {"type": "keepalive", "cursor": cursor}
 
-    async def idempotency_begin(self, device_id: str, key: str, body: bytes) -> tuple[bool, dict[str, Any] | None]:
+    async def idempotency_begin(
+        self, device_id: str, key: str, body: bytes
+    ) -> tuple[bool, int | None, dict[str, Any] | None]:
         request_hash = hashlib.sha256(body).hexdigest()
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -176,10 +206,14 @@ class Store:
                 await db.rollback()
                 if row["request_hash"] != request_hash:
                     raise ValueError("idempotency key was already used with another request body")
-                return False, json.loads(row["response_json"]) if row["response_json"] else None
+                return (
+                    False,
+                    row["status_code"],
+                    json.loads(row["response_json"]) if row["response_json"] else None,
+                )
             await db.execute("INSERT INTO idempotency VALUES(?,?,?,?,?,?)", (device_id, key, request_hash, None, None, utc_now().isoformat()))
             await db.commit()
-            return True, None
+            return True, None, None
 
     async def idempotency_finish(self, device_id: str, key: str, status: int, response: dict[str, Any]) -> None:
         async with self.connect() as db:
@@ -189,6 +223,127 @@ class Store:
     async def acknowledge(self, device_id: str, cursor: int) -> None:
         async with self.connect() as db:
             await db.execute("UPDATE devices SET acknowledged_cursor=MAX(acknowledged_cursor,?) WHERE id=?", (cursor, device_id))
+            await db.commit()
+
+    async def approval_is_pending(self, session_id: str, run_id: str, request_id: str | None) -> bool:
+        async with self.connect() as db:
+            rows = await db.execute_fetchall(
+                "SELECT kind,payload_json FROM events WHERE session_id=? AND run_id=? "
+                "AND kind IN ('approval.required','approval.resolved') ORDER BY cursor",
+                (session_id, run_id),
+            )
+        pending = False
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if request_id and payload.get("requestId") != request_id:
+                continue
+            pending = row["kind"] == "approval.required"
+        return pending
+
+    async def cached_summary(self, content_hash: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT summary_json FROM summary_cache WHERE content_hash=?",
+                (content_hash,),
+            )).fetchone()
+        return json.loads(row["summary_json"]) if row else None
+
+    async def cache_summary(self, content_hash: str, summary: dict[str, Any]) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO summary_cache VALUES(?,?,?)",
+                (content_hash, json.dumps(summary, separators=(",", ":")), utc_now().isoformat()),
+            )
+            await db.commit()
+
+    async def session_overlays(self, session_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        async with self.connect() as db:
+            # Only the placeholder count is interpolated; every session ID remains parameterized.
+            state_rows = await db.execute_fetchall(
+                f"SELECT session_id,pinned,queued_prompts_json,source_override FROM session_state WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
+            lifecycle_rows = await db.execute_fetchall(
+                f"SELECT e.session_id,e.kind FROM events e JOIN (SELECT session_id,MAX(cursor) cursor FROM events WHERE session_id IN ({placeholders}) AND kind IN ('run.started','run.completed','run.failed','run.cancelled') GROUP BY session_id) latest ON e.cursor=latest.cursor",
+                session_ids,
+            )
+            message_rows = await db.execute_fetchall(
+                f"SELECT e.session_id,e.payload_json FROM events e JOIN (SELECT session_id,MAX(cursor) cursor FROM events WHERE session_id IN ({placeholders}) AND kind='message.completed' GROUP BY session_id) latest ON e.cursor=latest.cursor",
+                session_ids,
+            )
+        overlays = {session_id: {"pinned": False, "state": "idle"} for session_id in session_ids}
+        for row in state_rows:
+            overlays[row["session_id"]]["pinned"] = bool(row["pinned"])
+            if row["source_override"]:
+                overlays[row["session_id"]]["source"] = row["source_override"]
+            if json.loads(row["queued_prompts_json"]):
+                overlays[row["session_id"]]["state"] = "queued"
+        for row in lifecycle_rows:
+            if overlays[row["session_id"]]["state"] != "queued":
+                overlays[row["session_id"]]["state"] = "busy" if row["kind"] == "run.started" else "idle"
+        for row in message_rows:
+            payload = json.loads(row["payload_json"])
+            overlays[row["session_id"]]["latestAnswer"] = (
+                payload.get("content") or payload.get("message") or payload.get("summary")
+            )
+        return overlays
+
+    async def set_session_source(self, session_id: str, source: str) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO session_state(session_id,source_override,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET source_override=excluded.source_override,"
+                "updated_at=excluded.updated_at",
+                (session_id, source, utc_now().isoformat()),
+            )
+            await db.commit()
+
+    async def session_is_busy(self, session_id: str) -> bool:
+        overlay = (await self.session_overlays([session_id])).get(session_id, {})
+        return overlay.get("state") in {"busy", "queued"}
+
+    async def session_turn_active(self, session_id: str) -> bool:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT kind FROM events WHERE session_id=? AND kind IN "
+                "('run.started','run.completed','run.failed','run.cancelled') "
+                "ORDER BY cursor DESC LIMIT 1",
+                (session_id,),
+            )).fetchone()
+        return bool(row and row["kind"] == "run.started")
+
+    async def update_run(
+        self,
+        run_id: str,
+        session_id: str,
+        device_id: str,
+        status: str,
+        initiated_by_g2: bool,
+    ) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO run_correlation(run_id,session_id,device_id,initiated_by_g2,status,updated_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
+                "status=excluded.status,updated_at=excluded.updated_at",
+                (
+                    run_id,
+                    session_id,
+                    device_id,
+                    int(initiated_by_g2),
+                    status,
+                    utc_now().isoformat(),
+                ),
+            )
+            active_run = None if status in {"completed", "failed", "cancelled"} else run_id
+            await db.execute(
+                "INSERT INTO session_state(session_id,active_run_id,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET active_run_id=excluded.active_run_id,"
+                "updated_at=excluded.updated_at",
+                (session_id, active_run, utc_now().isoformat()),
+            )
             await db.commit()
 
     async def audit(self, device_id: str | None, action: str, session_id: str | None, run_id: str | None, outcome: str, detail: dict[str, Any] | None = None) -> None:

@@ -9,13 +9,16 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okhttp3.sse.EventSource
+import okhttp3.sse.EventSourceListener
+import okhttp3.sse.EventSources
 
 class BridgeClient(private val credentials: DeviceCredentials, private val client: OkHttpClient = OkHttpClient()) {
     private val json = Json { ignoreUnknownKeys = true }
     private fun request(path: String) = Request.Builder().url("${credentials.origin}$path").header("Authorization", "Bearer ${credentials.credential}").header("X-Device-Id", credentials.deviceId)
     suspend fun snapshot(): Snapshot = get("/v1/snapshot")
     suspend fun sessions(): List<SessionSummary> = get("/v1/sessions")
-    suspend fun messages(sessionId: String): String = raw("/v1/sessions/$sessionId/messages")
+    suspend fun messages(sessionId: String, limit: Int = 100, offset: Int = 0): MessagePage = get("/v1/sessions/$sessionId/messages?limit=$limit&offset=$offset")
     suspend fun jobs(): String = raw("/v1/jobs")
     suspend fun models(): String = raw("/v1/models")
     suspend fun skills(): String = raw("/v1/skills")
@@ -31,6 +34,12 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
             .header("X-Device-Id", credentials.deviceId)
             .build()
         return client.newWebSocket(socketRequest, listener)
+    }
+    fun events(cursor: Long, listener: EventSourceListener): EventSource {
+        val eventRequest = request("/v1/events?after=$cursor")
+            .header("Accept", "text/event-stream")
+            .build()
+        return EventSources.createFactory(client).newEventSource(eventRequest, listener)
     }
     private suspend inline fun <reified T> get(path: String): T = withContext(Dispatchers.IO) { client.newCall(request(path).build()).execute().use { response -> if (!response.isSuccessful) error("Bridge ${response.code}"); json.decodeFromString(response.body!!.string()) } }
     private suspend fun raw(path: String): String = withContext(Dispatchers.IO) { client.newCall(request(path).build()).execute().use { response -> if (!response.isSuccessful) error("Bridge ${response.code}"); response.body!!.string() } }

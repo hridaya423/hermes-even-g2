@@ -12,6 +12,7 @@ export type RuntimeReadiness = {
   guiReady: boolean;
   tailscale: boolean;
   stt: boolean;
+  summary?: boolean;
   reason?: string;
 };
 
@@ -42,6 +43,19 @@ export type SessionSummary = {
   updatedAt: string;
   pinned: boolean;
   latestAnswer?: string;
+};
+
+export type AgentMessage = {
+  id: string;
+  sessionId: string;
+  role: "user" | "assistant" | "tool" | "system";
+  content: string;
+  reasoning?: string;
+  timestamp?: string;
+  finishReason?: string;
+  toolName?: string;
+  toolCalls?: unknown[];
+  tokenCount?: number;
 };
 
 export type ApprovalChoice = "once" | "session" | "always" | "deny";
@@ -101,4 +115,3 @@ export type ChannelClientMessage =
   | { type: "hello"; afterCursor: number }
   | { type: "ack"; cursor: number }
   | { type: "ping" };
-

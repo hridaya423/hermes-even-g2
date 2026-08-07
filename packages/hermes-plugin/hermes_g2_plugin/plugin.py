@@ -46,9 +46,10 @@ class HermesG2Observer:
             "on_session_start": "session.updated", "on_session_end": "session.updated",
             "on_session_finalize": "message.completed", "on_session_reset": "session.updated",
             "pre_tool_call": "tool.started", "post_tool_call": "tool.completed",
-            "post_llm_call": "run.progress", "subagent_start": "subagent.started",
-            "subagent_stop": "subagent.completed", "pre_approval_request": "approval.required",
-            "post_approval_response": "approval.resolved",
+            "pre_llm_call": "run.started", "post_llm_call": "run.completed",
+            "subagent_start": "subagent.started",
+            "subagent_stop": "subagent.completed", "pre_approval_request": "attention.created",
+            "post_approval_response": "attention.resolved",
         }[hook]
 
     async def on_session_start(self, **kwargs): await self._send("on_session_start", kwargs)
@@ -57,6 +58,7 @@ class HermesG2Observer:
     async def on_session_reset(self, **kwargs): await self._send("on_session_reset", kwargs)
     async def pre_tool_call(self, **kwargs): await self._send("pre_tool_call", kwargs)
     async def post_tool_call(self, **kwargs): await self._send("post_tool_call", kwargs)
+    async def pre_llm_call(self, **kwargs): await self._send("pre_llm_call", kwargs)
     async def post_llm_call(self, **kwargs): await self._send("post_llm_call", kwargs)
     async def subagent_start(self, **kwargs): await self._send("subagent_start", kwargs)
     async def subagent_stop(self, **kwargs): await self._send("subagent_stop", kwargs)
@@ -73,6 +75,7 @@ def register(ctx) -> None:
         "on_session_reset",
         "pre_tool_call",
         "post_tool_call",
+        "pre_llm_call",
         "post_llm_call",
         "subagent_start",
         "subagent_stop",

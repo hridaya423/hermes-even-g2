@@ -23,9 +23,14 @@ chmod 0600 "$config_root/bridge.env"
 rsync -a --delete "$project_dir/services/bridge/" "$install_root/bridge/"
 python3.11 -m venv "$install_root/venv"
 "$install_root/venv/bin/pip" install --disable-pip-version-check "$install_root/bridge"
+if [[ -x $project_dir/services/apple-summary-helper/.build/release/hermes-g2-summary ]]; then
+  install -d -m 0755 "$install_root/bin"
+  install -m 0755 "$project_dir/services/apple-summary-helper/.build/release/hermes-g2-summary" "$install_root/bin/hermes-g2-summary"
+else
+  print -u2 "Apple summary helper is absent; deterministic local summaries remain enabled."
+fi
 install -m 0644 "$project_dir/deploy/launchd/com.honey.hermes-g2.bridge.plist" /Library/LaunchDaemons/com.honey.hermes-g2.bridge.plist
 launchctl bootout system/com.honey.hermes-g2.bridge 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.honey.hermes-g2.bridge.plist
 launchctl enable system/com.honey.hermes-g2.bridge
 print "Bridge installed. Configure Tailscale Serve with scripts/configure-tailscale.sh."
-
