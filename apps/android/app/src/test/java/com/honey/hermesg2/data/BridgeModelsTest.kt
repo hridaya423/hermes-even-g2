@@ -17,4 +17,12 @@ class BridgeModelsTest {
         assertEquals("2026-08-09T08:00:00Z", job.nextRunAt)
         assertEquals("completed", job.lastStatus)
     }
+
+    @Test fun `bridge device record decodes scopes and durable cursor`() {
+        val devices = json.decodeFromString<List<DeviceRecord>>(
+            """[{"id":"android-1","name":"Pixel","kind":"android","scopes":["sessions:read","devices:manage"],"created_at":"2026-08-08T00:00:00Z","expires_at":null,"revoked_at":null,"acknowledged_cursor":42,"scopes_json":"ignored"}]"""
+        )
+        assertEquals(listOf("sessions:read", "devices:manage"), devices.single().scopes)
+        assertEquals(42, devices.single().acknowledgedCursor)
+    }
 }

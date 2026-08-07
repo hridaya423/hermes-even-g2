@@ -23,6 +23,13 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
     suspend fun models(): String = raw("/v1/models")
     suspend fun skills(): String = raw("/v1/skills")
     suspend fun audit(): String = raw("/v1/audit")
+    suspend fun devices(): List<DeviceRecord> = get("/v1/devices")
+    suspend fun revokeDevice(deviceId: String): String = withContext(Dispatchers.IO) {
+        client.newCall(request("/v1/devices/$deviceId/revoke").post(ByteArray(0).toRequestBody(null)).build()).execute().use { response ->
+            if (!response.isSuccessful) error(response.body?.string() ?: "Bridge ${response.code}")
+            response.body?.string().orEmpty()
+        }
+    }
     suspend fun action(value: AgentAction): String = withContext(Dispatchers.IO) {
         val body = json.encodeToString(AgentAction.serializer(), value).toRequestBody("application/json".toMediaType())
         client.newCall(request("/v1/actions").post(body).build()).execute().use { response -> if (!response.isSuccessful) error(response.body?.string() ?: "Bridge ${response.code}"); response.body?.string().orEmpty() }
