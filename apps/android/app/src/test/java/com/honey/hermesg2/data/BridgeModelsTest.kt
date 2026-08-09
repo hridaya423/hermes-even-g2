@@ -9,6 +9,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BridgeModelsTest {
+    @Test fun `skills inventory decodes the live Hermes nested payload`() {
+        val inventory = json.decodeFromString<SkillsInventory>(
+            """{"skills":{"object":"list","data":[{"name":"research","description":"Deep research","category":"productivity"}]},"toolsets":{"object":"list","platform":"hermes-agent","data":[{"name":"browser","label":"Browser","description":"Web tools","enabled":true,"configured":false,"tools":["open","search"]}]}}"""
+        )
+
+        assertEquals("research", inventory.skills.data.single().name)
+        assertEquals("productivity", inventory.skills.data.single().category)
+        assertTrue(inventory.toolsets.data.single().enabled)
+        assertEquals(listOf("open", "search"), inventory.toolsets.data.single().tools)
+    }
+
     @Test fun `durable replay preserves ordered cursors and pagination state`() {
         val replay = json.decodeFromString<EventReplay>(
             """{"events":[{"eventId":"event-1","cursor":41,"kind":"run.progress","timestamp":"2026-08-09T00:00:00Z","source":"bridge"},{"eventId":"event-2","cursor":42,"kind":"run.completed","timestamp":"2026-08-09T00:00:01Z","source":"bridge"}],"nextCursor":42,"hasMore":true}"""
