@@ -64,8 +64,12 @@ PY
 fi
 
 tailscale_state="unknown"
-if command -v tailscale >/dev/null 2>&1; then
-  tailscale_state=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print("running" if json.load(sys.stdin).get("BackendState") == "Running" else "not_running")' 2>/dev/null || print "error")
+tailscale_binary=$(command -v tailscale 2>/dev/null || true)
+if [[ -z $tailscale_binary && -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+  tailscale_binary=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+fi
+if [[ -n $tailscale_binary ]]; then
+  tailscale_state=$($tailscale_binary status --json 2>/dev/null | python3 -c 'import json,sys; print("running" if json.load(sys.stdin).get("BackendState") == "Running" else "not_running")' 2>/dev/null || print "error")
 fi
 
 python3 - "$hermes_status_code" "$patch_state" "$bridge_health" "$hermes_health" "$system_service" "$plugin_state" "$tailscale_state" <<'PY'
