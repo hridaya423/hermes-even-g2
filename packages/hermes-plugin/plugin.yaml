@@ -3,3 +3,16 @@ version: 0.1.0
 description: Fail-open lifecycle observation for the private Hermes G2 bridge
 requires_env:
   - HERMES_G2_PLUGIN_SECRET
+provides_hooks:
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+  - pre_tool_call
+  - post_tool_call
+  - pre_llm_call
+  - post_llm_call
+  - subagent_start
+  - subagent_stop
+  - pre_approval_request
+  - post_approval_response

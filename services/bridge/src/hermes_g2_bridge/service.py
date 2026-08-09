@@ -93,6 +93,12 @@ class ControlService:
         if not self.runtime.get("coreReady"):
             raise ValueError("Hermes native session history and streaming are not ready")
 
+    async def ensure_core(self) -> None:
+        """Refresh capabilities before rejecting an action after a Hermes restart."""
+        if not self.runtime.get("coreReady"):
+            await self.probe()
+        self.require_core()
+
     async def execute(self, action: AgentAction, device: dict[str, Any]) -> dict[str, Any]:
         if utc_now() - action.created_at > timedelta(seconds=self.action_max_age):
             raise ValueError("action is stale")
@@ -115,7 +121,7 @@ class ControlService:
                 await db.execute("INSERT INTO session_state(session_id,pinned,updated_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET pinned=excluded.pinned,updated_at=excluded.updated_at", (action.session_id, int(kind == ActionKind.PIN_SESSION), utc_now().isoformat()))
                 await db.commit()
             return {"status": "ok", "pinned": kind == ActionKind.PIN_SESSION}
-        self.require_core()
+        await self.ensure_core()
         if kind == ActionKind.CREATE_SESSION:
             created = await self.hermes.create_session(action.payload)
             await self.store.set_session_source(created["id"], "even_g2")

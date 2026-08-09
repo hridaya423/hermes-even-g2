@@ -11,7 +11,7 @@ class HermesG2Observer:
         self.origin = os.environ.get("HERMES_G2_PLUGIN_ORIGIN", "http://127.0.0.1:8765")
         self.secret = os.environ.get("HERMES_G2_PLUGIN_SECRET", "")
 
-    async def _send(self, kind: str, kwargs: dict[str, Any]) -> None:
+    def _send(self, kind: str, kwargs: dict[str, Any]) -> None:
         if not self.secret:
             return
         session_id = str(
@@ -31,8 +31,8 @@ class HermesG2Observer:
             "errorType": type(kwargs["error"]).__name__ if kwargs.get("error") else None,
         }
         try:
-            async with httpx.AsyncClient(timeout=0.75) as client:
-                await client.post(
+            with httpx.Client(timeout=0.75) as client:
+                client.post(
                     f"{self.origin}/internal/plugin/events",
                     headers={"X-Plugin-Secret": self.secret},
                     json={"kind": self._event_kind(kind), "source": "plugin", "sessionId": session_id, "runId": run_id, "payload": safe},
@@ -52,18 +52,18 @@ class HermesG2Observer:
             "post_approval_response": "attention.resolved",
         }[hook]
 
-    async def on_session_start(self, **kwargs): await self._send("on_session_start", kwargs)
-    async def on_session_end(self, **kwargs): await self._send("on_session_end", kwargs)
-    async def on_session_finalize(self, **kwargs): await self._send("on_session_finalize", kwargs)
-    async def on_session_reset(self, **kwargs): await self._send("on_session_reset", kwargs)
-    async def pre_tool_call(self, **kwargs): await self._send("pre_tool_call", kwargs)
-    async def post_tool_call(self, **kwargs): await self._send("post_tool_call", kwargs)
-    async def pre_llm_call(self, **kwargs): await self._send("pre_llm_call", kwargs)
-    async def post_llm_call(self, **kwargs): await self._send("post_llm_call", kwargs)
-    async def subagent_start(self, **kwargs): await self._send("subagent_start", kwargs)
-    async def subagent_stop(self, **kwargs): await self._send("subagent_stop", kwargs)
-    async def pre_approval_request(self, **kwargs): await self._send("pre_approval_request", kwargs)
-    async def post_approval_response(self, **kwargs): await self._send("post_approval_response", kwargs)
+    def on_session_start(self, **kwargs): self._send("on_session_start", kwargs)
+    def on_session_end(self, **kwargs): self._send("on_session_end", kwargs)
+    def on_session_finalize(self, **kwargs): self._send("on_session_finalize", kwargs)
+    def on_session_reset(self, **kwargs): self._send("on_session_reset", kwargs)
+    def pre_tool_call(self, **kwargs): self._send("pre_tool_call", kwargs)
+    def post_tool_call(self, **kwargs): self._send("post_tool_call", kwargs)
+    def pre_llm_call(self, **kwargs): self._send("pre_llm_call", kwargs)
+    def post_llm_call(self, **kwargs): self._send("post_llm_call", kwargs)
+    def subagent_start(self, **kwargs): self._send("subagent_start", kwargs)
+    def subagent_stop(self, **kwargs): self._send("subagent_stop", kwargs)
+    def pre_approval_request(self, **kwargs): self._send("pre_approval_request", kwargs)
+    def post_approval_response(self, **kwargs): self._send("post_approval_response", kwargs)
 
 
 def register(ctx) -> None:

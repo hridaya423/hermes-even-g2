@@ -64,6 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def reconcile():
             while True:
                 try:
+                    await service.probe()
                     await service.reconcile_once()
                     await store.compact_events(config.event_retention_days, config.event_retention_floor)
                 except Exception as error:

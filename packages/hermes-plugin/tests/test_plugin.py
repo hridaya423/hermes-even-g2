@@ -1,3 +1,5 @@
+import inspect
+
 from hermes_g2_plugin import HermesG2Observer, register
 
 
@@ -19,6 +21,7 @@ def test_registers_installed_hermes_lifecycle_contract(monkeypatch):
         "subagent_stop", "pre_approval_request", "post_approval_response",
     }
     assert all(callable(callback) for callback in context.hooks.values())
+    assert all(not inspect.iscoroutinefunction(callback) for callback in context.hooks.values())
 
 
 def test_hook_event_families_are_durable_attention_events():

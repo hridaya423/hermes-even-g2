@@ -55,4 +55,29 @@ hermes_path.write_text("\n".join(output) + "\n")
 hermes_path.chmod(0o600)
 PY
 
+config_path=$hermes_root/config.yaml
+if [[ -f $config_path ]] && ! grep -qE '^    - hermes-g2-observer[[:space:]]*$' "$config_path"; then
+  config_backup="$config_path.hermes-g2-before-enable"
+  if [[ ! -e $config_backup ]]; then
+    cp -p "$config_path" "$config_backup"
+  fi
+  HERMES_G2_CONFIG="$config_path" python3 <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["HERMES_G2_CONFIG"])
+lines = path.read_text().splitlines()
+if any(line.strip() == "- hermes-g2-observer" for line in lines):
+    raise SystemExit(0)
+
+for index, line in enumerate(lines):
+    if line == "  enabled:" and index > 0 and lines[index - 1] == "plugins:":
+        lines.insert(index + 1, "    - hermes-g2-observer")
+        path.write_text("\n".join(lines) + "\n")
+        break
+else:
+    raise SystemExit("plugins.enabled block was not found; refusing to rewrite config.yaml")
+PY
+fi
+
 print "Hermes G2 observer staged. Restart Hermes only after any in-progress Hermes repair is complete."
