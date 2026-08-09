@@ -90,14 +90,30 @@ if ! launchctl print "$launch_domain" >/dev/null 2>&1; then
   launch_domain="user/$UID"
 fi
 launchctl bootout "$launch_domain/com.honey.hermes-g2.bridge" 2>/dev/null || true
+bridge_pid=$(lsof -nP -tiTCP:8765 -sTCP:LISTEN 2>/dev/null || true)
+if [[ -n $bridge_pid ]]; then
+  if [[ $bridge_pid != <-> ]]; then
+    print -u2 "Port 8765 has multiple listeners; refusing an ambiguous replacement."
+    exit 3
+  fi
+  bridge_command=$(ps -p "$bridge_pid" -o command= 2>/dev/null || true)
+  if [[ $bridge_command != *hermes-g2-bridge* ]]; then
+    print -u2 "Port 8765 is owned by an unexpected process; refusing to replace it."
+    exit 3
+  fi
+  kill "$bridge_pid"
+  for attempt in {1..20}; do
+    kill -0 "$bridge_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$bridge_pid" 2>/dev/null; then
+    print -u2 "The previous Hermes G2 bridge did not stop cleanly."
+    exit 3
+  fi
+fi
 if launchctl bootstrap "$launch_domain" "$launch_agent"; then
   launchctl enable "$launch_domain/com.honey.hermes-g2.bridge"
 else
-  bridge_pid=$(lsof -nP -tiTCP:8765 -sTCP:LISTEN 2>/dev/null || true)
-  if [[ $bridge_pid == <-> ]]; then
-    kill "$bridge_pid"
-    sleep 1
-  fi
   nohup env HERMES_G2_ENV_FILE="$env_file" "$install_root/venv/bin/hermes-g2-bridge" serve \
     >"$log_root/bridge.log" 2>"$log_root/bridge.error.log" </dev/null &
   launch_domain="detached (until the next login loads the installed LaunchAgent)"
