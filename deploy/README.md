@@ -9,6 +9,7 @@ The boot path uses LaunchDaemons because core Hermes chat must work without an A
 5. Run `sudo scripts/configure-tailscale.sh`, confirm the MagicDNS HTTPS origin, and generate separate `android`, `hub`, and `simulator` pairing codes.
 6. Run `scripts/install-hermes-plugin.sh`. It stages the observer and its independent secret but deliberately does not restart Hermes; restart only after any in-progress Hermes repair is complete.
 7. Run `hermes-g2-bridge doctor` without copying its secret environment into a shell history.
+8. Run `scripts/audit-mac-mini.sh` after repairs or reboots. It is read-only and reports whether the Hermes patch is applied, the observer is active, core services are reachable, Tailscale is running, and the system LaunchDaemon is loaded; it never restarts Hermes or changes credentials.
 
 GUI-dependent tools remain unavailable while the Mac mini is logged out. The bridge exposes this separately from core readiness; it does not restart or silently rerun a failed turn.
 
