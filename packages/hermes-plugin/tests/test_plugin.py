@@ -24,10 +24,12 @@ def test_registers_installed_hermes_lifecycle_contract(monkeypatch):
     assert all(not inspect.iscoroutinefunction(callback) for callback in context.hooks.values())
 
 
-def test_hook_event_families_are_durable_attention_events():
+def test_hook_event_families_never_compete_with_native_run_terminal_events():
     assert HermesG2Observer._event_kind("pre_approval_request") == "attention.created"
     assert HermesG2Observer._event_kind("post_approval_response") == "attention.resolved"
     assert HermesG2Observer._event_kind("subagent_start") == "subagent.started"
-    assert HermesG2Observer._event_kind("pre_llm_call") == "run.started"
-    assert HermesG2Observer._event_kind("post_llm_call") == "run.completed"
-    assert HermesG2Observer._event_kind("on_session_finalize") == "message.completed"
+    assert HermesG2Observer._event_kind("pre_llm_call") == "run.progress"
+    assert HermesG2Observer._event_kind("post_llm_call") == "run.progress"
+    assert HermesG2Observer._event_kind("on_session_finalize") == "session.updated"
+    assert HermesG2Observer._run_id({"turn_id": "session-like-id"}) is None
+    assert HermesG2Observer._run_id({"run_id": "run-authoritative"}) == "run-authoritative"

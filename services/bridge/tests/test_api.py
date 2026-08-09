@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from hermes_g2_bridge.app import create_app
 from hermes_g2_bridge.config import Settings
+from hermes_g2_bridge.hermes import HermesError
 from hermes_g2_bridge.models import EventInput
 
 
@@ -147,3 +148,20 @@ def test_event_replay_is_authenticated_bounded_and_cursor_ordered(tmp_path):
         assert [event["cursor"] for event in response.json()["events"]] == [1, 2]
         assert response.json()["hasMore"] is True
         assert response.json()["nextCursor"] == 2
+
+
+def test_hermes_dependency_failures_are_clean_service_unavailable_responses(tmp_path):
+    app = configured_app(tmp_path)
+    app.state.control.sessions = AsyncMock(
+        side_effect=HermesError("Hermes GET /api/sessions is unreachable", 503)
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        _, headers = pair(client, app)
+
+        response = client.get("/v1/snapshot", headers=headers)
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "Hermes GET /api/sessions is unreachable",
+            "code": "hermes_unavailable",
+        }

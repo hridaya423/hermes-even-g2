@@ -17,9 +17,7 @@ class HermesG2Observer:
         session_id = str(
             kwargs.get("session_id") or kwargs.get("sessionId") or kwargs.get("session_key") or ""
         ) or None
-        run_id = str(
-            kwargs.get("run_id") or kwargs.get("runId") or kwargs.get("turn_id") or ""
-        ) or None
+        run_id = self._run_id(kwargs)
         safe = {
             "hook": kind,
             "tool": kwargs.get("tool_name") or kwargs.get("tool"),
@@ -41,12 +39,16 @@ class HermesG2Observer:
             return
 
     @staticmethod
+    def _run_id(kwargs: dict[str, Any]) -> str | None:
+        return str(kwargs.get("run_id") or kwargs.get("runId") or "") or None
+
+    @staticmethod
     def _event_kind(hook: str) -> str:
         return {
             "on_session_start": "session.updated", "on_session_end": "session.updated",
-            "on_session_finalize": "message.completed", "on_session_reset": "session.updated",
+            "on_session_finalize": "session.updated", "on_session_reset": "session.updated",
             "pre_tool_call": "tool.started", "post_tool_call": "tool.completed",
-            "pre_llm_call": "run.started", "post_llm_call": "run.completed",
+            "pre_llm_call": "run.progress", "post_llm_call": "run.progress",
             "subagent_start": "subagent.started",
             "subagent_stop": "subagent.completed", "pre_approval_request": "attention.created",
             "post_approval_response": "attention.resolved",

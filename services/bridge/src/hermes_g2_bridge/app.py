@@ -13,7 +13,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import Settings
 from .hermes import HermesClient, HermesError
@@ -78,6 +78,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Hermes G2 Bridge", version="0.1.0", lifespan=lifespan)
     app.add_middleware(ExternalBasePathMiddleware, base_path=config.external_base_path)
     app.state.store, app.state.settings, app.state.control = store, config, service
+
+    @app.exception_handler(HermesError)
+    async def hermes_dependency_error(_request: Request, error: HermesError):
+        status = error.status_code if 400 <= error.status_code < 500 else 503
+        return JSONResponse(
+            status_code=status,
+            content={
+                "detail": str(error),
+                "code": "hermes_unavailable" if status == 503 else "hermes_error",
+            },
+        )
 
     @app.get("/health")
     async def health():
