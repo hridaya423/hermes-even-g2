@@ -126,3 +126,24 @@ def test_snapshot_exposes_active_runs_with_versioned_camel_case_fields(tmp_path)
             "status": "started",
             "updatedAt": response.json()["activeRuns"][0]["updatedAt"],
         }]
+
+
+def test_event_replay_is_authenticated_bounded_and_cursor_ordered(tmp_path):
+    app = configured_app(tmp_path)
+    with TestClient(app) as client:
+        _, headers = pair(client, app)
+        for index in range(3):
+            client.portal.call(app.state.store.append_event, EventInput(
+                kind="run.progress",
+                source="bridge",
+                sessionId="session-1",
+                payload={"index": index},
+            ))
+
+        assert client.get("/v1/events/replay?after=0&limit=2").status_code == 401
+        response = client.get("/v1/events/replay?after=0&limit=2", headers=headers)
+
+        assert response.status_code == 200
+        assert [event["cursor"] for event in response.json()["events"]] == [1, 2]
+        assert response.json()["hasMore"] is True
+        assert response.json()["nextCursor"] == 2

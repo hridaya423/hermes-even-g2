@@ -17,6 +17,7 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
     private val json = Json { ignoreUnknownKeys = true }
     private fun request(path: String) = Request.Builder().url("${credentials.origin}$path").header("Authorization", "Bearer ${credentials.credential}").header("X-Device-Id", credentials.deviceId)
     suspend fun snapshot(): Snapshot = get("/v1/snapshot")
+    suspend fun replayEvents(cursor: Long, limit: Int = 100): EventReplay = get("/v1/events/replay?after=$cursor&limit=$limit")
     suspend fun sessions(): List<SessionSummary> = get("/v1/sessions")
     suspend fun messages(sessionId: String, limit: Int = 100, offset: Int = 0): MessagePage = get("/v1/sessions/$sessionId/messages?limit=$limit&offset=$offset")
     suspend fun jobs(): JobList = get("/v1/jobs")

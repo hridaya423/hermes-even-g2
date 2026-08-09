@@ -5,9 +5,20 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BridgeModelsTest {
+    @Test fun `durable replay preserves ordered cursors and pagination state`() {
+        val replay = json.decodeFromString<EventReplay>(
+            """{"events":[{"eventId":"event-1","cursor":41,"kind":"run.progress","timestamp":"2026-08-09T00:00:00Z","source":"bridge"},{"eventId":"event-2","cursor":42,"kind":"run.completed","timestamp":"2026-08-09T00:00:01Z","source":"bridge"}],"nextCursor":42,"hasMore":true}"""
+        )
+
+        assertEquals(listOf(41L, 42L), replay.events.map { it.cursor })
+        assertEquals(42L, replay.nextCursor)
+        assertTrue(replay.hasMore)
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     @Test fun `pairing request declares the Android device kind`() {

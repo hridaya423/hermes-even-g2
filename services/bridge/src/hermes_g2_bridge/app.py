@@ -230,6 +230,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(422, str(error)) from error
         return {**result, "sessionId": session_id}
 
+    @app.get("/v1/events/replay")
+    async def event_replay(
+        after: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=500),
+        device=Depends(require_scope("sessions:read")),
+    ):
+        rows = await store.events_after(after, limit + 1)
+        events = rows[:limit]
+        return {
+            "events": events,
+            "nextCursor": events[-1]["cursor"] if events else after,
+            "hasMore": len(rows) > limit,
+        }
+
     @app.get("/v1/events")
     async def events(after: int = Query(0, ge=0), device=Depends(require_scope("sessions:read"))):
         async def generate():

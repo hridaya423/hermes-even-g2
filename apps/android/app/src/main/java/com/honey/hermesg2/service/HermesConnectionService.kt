@@ -101,9 +101,51 @@ class HermesConnectionService : Service() {
                     }
                 }
             }
-            override fun onClosed(eventSource: EventSource) = schedule(bridge, attempt + 1)
-            override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) = schedule(bridge, attempt + 1)
+            override fun onClosed(eventSource: EventSource) = recoverSse(bridge, attempt + 1)
+            override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) = recoverSse(bridge, attempt + 1)
         })
+    }
+
+    private fun recoverSse(bridge: BridgeClient, attempt: Int) {
+        if (attempt >= 6) pollThenReconnect(bridge) else schedule(bridge, attempt, useSse = true)
+    }
+
+    private fun pollThenReconnect(bridge: BridgeClient) {
+        reconnect?.cancel()
+        socket?.cancel()
+        eventSource?.cancel()
+        reconnect = scope.launch {
+            updateStatus("Hermes polling fallback")
+            repeat(12) {
+                val replay = runCatching { bridge.replayEvents(cursor.get()) }.getOrNull()
+                if (replay != null) {
+                    replay.events.forEach { event ->
+                        handleEvent(json.encodeToString(DurableEvent.serializer(), event))
+                    }
+                    if (replay.events.isNotEmpty()) acknowledge(bridge, replay.nextCursor, "poll-${replay.nextCursor}")
+                    if (replay.hasMore) return@repeat
+                }
+                delay(5_000)
+            }
+            if (isActive) open(bridge, 0)
+        }
+    }
+
+    private fun acknowledge(bridge: BridgeClient, value: Long, key: String) {
+        scope.launch {
+            val credentials = SecureCredentials(this@HermesConnectionService).load() ?: return@launch
+            runCatching {
+                bridge.action(
+                    AgentAction(
+                        kind = "acknowledge",
+                        deviceId = credentials.deviceId,
+                        idempotencyKey = key,
+                        createdAt = Instant.now().toString(),
+                        payload = mapOf("cursor" to value.toString()),
+                    )
+                )
+            }
+        }
     }
 
     private fun handleEvent(text: String, acknowledge: ((DurableEvent) -> Unit)? = null) {
