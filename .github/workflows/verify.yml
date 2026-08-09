@@ -1,0 +1,72 @@
+name: Hermes G2 verification
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.8.x"
+
+      - name: Install bridge dependencies
+        run: uv sync --directory services/bridge --extra dev
+
+      - name: Verify Python bridge and observer
+        env:
+          PYTHONPATH: ${{ github.workspace }}/packages/hermes-plugin
+        run: |
+          services/bridge/.venv/bin/ruff check packages/hermes-plugin services/bridge
+          services/bridge/.venv/bin/pytest packages/hermes-plugin/tests services/bridge/tests
+
+      - name: Verify protocol and Hub
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+          git diff --exit-code -- apps/hub/HermesG2.ehpk
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build and test Android companion
+        working-directory: apps/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest assembleDebug
+
+      - name: Verify macOS summary helper
+        run: swift build -c release --package-path services/apple-summary-helper
+
+      - name: Verify scripts and diff
+        run: |
+          zsh -n scripts/*.sh
+          git diff --check
