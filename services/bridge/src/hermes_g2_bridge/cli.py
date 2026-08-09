@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import json
+import logging
+from typing import Any
 
 import uvicorn
 
@@ -8,6 +10,70 @@ from .app import create_app
 from .config import Settings
 from .hermes import HermesClient
 from .store import Store
+
+logger = logging.getLogger(__name__)
+
+
+async def build_doctor_report(settings: Settings, client: HermesClient | None = None) -> dict[str, Any]:
+    hermes = client or HermesClient(
+        settings.hermes_origin,
+        settings.hermes_api_key.get_secret_value(),
+    )
+    capabilities: dict[str, Any] = {}
+    hermes_state = "unreachable"
+    try:
+        capabilities = await hermes.probe()
+        hermes_state = "ready"
+    except Exception as error:
+        logger.debug("Hermes doctor probe failed: %s", type(error).__name__)
+    finally:
+        await hermes.close()
+
+    core_ready = all(
+        capabilities.get(name)
+        for name in ("nativeSessions", "sessionHistory", "sessionStreaming")
+    )
+    detailed = capabilities.get("detailed", {})
+    gui_ready = bool(detailed.get("gui_ready", detailed.get("guiReady", False)))
+    database_state = "ready" if settings.database_path.parent.exists() else "missing"
+    stt_state = (
+        "ready"
+        if settings.whisper_binary.is_file()
+        and settings.whisper_binary.stat().st_mode & 0o111
+        and settings.whisper_model.is_file()
+        else "missing"
+    )
+    tailscale_state = "missing"
+    if settings.tailscale_cli.is_file():
+        try:
+            process = await asyncio.create_subprocess_exec(
+                str(settings.tailscale_cli),
+                "status",
+                "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            payload = json.loads(stdout) if process.returncode == 0 else {}
+            tailscale_state = (
+                "ready" if payload.get("BackendState") == "Running" else "not_running"
+            )
+        except (OSError, TimeoutError, json.JSONDecodeError):
+            tailscale_state = "error"
+
+    checks = {
+        "database": database_state,
+        "stt": stt_state,
+        "tailscale": tailscale_state,
+        "hermes": hermes_state,
+    }
+    return {
+        "ok": core_ready and all(value == "ready" for value in checks.values()),
+        "coreReady": core_ready,
+        "guiReady": gui_ready,
+        "checks": checks,
+        "hermes": capabilities,
+    }
 
 
 def main() -> None:
@@ -32,11 +98,7 @@ def main() -> None:
         asyncio.run(make_pairing())
     elif args.command == "doctor":
         async def doctor():
-            client = HermesClient(settings.hermes_origin, settings.hermes_api_key.get_secret_value())
-            try:
-                capabilities = await client.probe()
-                print(json.dumps({"databaseParentExists": settings.database_path.parent.exists(), "sttBinary": settings.whisper_binary.exists(), "sttModel": settings.whisper_model.exists(), "hermes": capabilities}, indent=2))
-            finally:
-                await client.close()
-        asyncio.run(doctor())
-
+            report = await build_doctor_report(settings)
+            print(json.dumps(report, indent=2))
+            return 0 if report["ok"] else 1
+        raise SystemExit(asyncio.run(doctor()))
