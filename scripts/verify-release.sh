@@ -14,10 +14,12 @@ swift build -c release --package-path "$project_dir/services/apple-summary-helpe
 zsh -n "$project_dir"/scripts/*.sh
 git -C "$project_dir" diff --check
 
-if [[ -n ${HERMES_AGENT_CHECKOUT:-} ]]; then
+if [[ -n ${HERMES_AGENT_CHECKOUT:-} && -d ${HERMES_AGENT_CHECKOUT}/.git ]]; then
   if ! git -C "$HERMES_AGENT_CHECKOUT" apply --check "$project_dir/patches/hermes-session-run-control.patch" 2>/dev/null; then
     git -C "$HERMES_AGENT_CHECKOUT" apply --reverse --check "$project_dir/patches/hermes-session-run-control.patch"
   fi
+elif [[ -n ${HERMES_AGENT_CHECKOUT:-} ]]; then
+  print "Hermes compatibility checkout is absent; skipped external patch-state check."
 fi
 
 test -s "$project_dir/apps/hub/HermesG2.ehpk"
