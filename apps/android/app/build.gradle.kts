@@ -8,12 +8,16 @@ plugins {
 android {
     namespace = "com.honey.hermesg2"
     compileSdk = 36
+    val defaultBridgeOrigin = providers.gradleProperty("hermesG2Origin")
+        .orElse("https://hridyas-mini.tail59dec9.ts.net/hermes-g2")
+        .get()
     defaultConfig {
         applicationId = "com.honey.hermesg2"
         minSdk = 28
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        buildConfigField("String", "DEFAULT_BRIDGE_ORIGIN", "\"${defaultBridgeOrigin.replace("\\\"", "\\\\\"")}\"")
     }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }

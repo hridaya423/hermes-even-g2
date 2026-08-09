@@ -1,11 +1,18 @@
 package com.honey.hermesg2.data
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class BridgeModelsTest {
     private val json = Json { ignoreUnknownKeys = true }
+
+    @Test fun `pairing request declares the Android device kind`() {
+        val encoded = json.encodeToString(PairingRequest.serializer(), PairingRequest("123456", "Pixel", deviceKind = "android"))
+        assertEquals("android", json.parseToJsonElement(encoded).jsonObject["deviceKind"]?.jsonPrimitive?.content)
+    }
 
     @Test fun `live Hermes job envelope decodes into controller fields`() {
         val value = json.decodeFromString<JobList>(

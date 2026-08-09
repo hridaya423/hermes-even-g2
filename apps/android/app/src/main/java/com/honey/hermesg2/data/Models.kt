@@ -5,7 +5,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 
 @Serializable data class DeviceCredentials(val origin: String, val deviceId: String, val credential: String)
-@Serializable data class PairingRequest(val code: String, val deviceName: String, val deviceKind: String = "android")
+@Serializable data class PairingRequest(val code: String, val deviceName: String, val deviceKind: String)
 @Serializable data class PairingResponse(val deviceId: String, val credential: String, val scopes: List<String>)
 @Serializable data class SessionSummary(val id: String, val title: String = "Untitled", val source: String = "unknown", val model: String? = null, val state: String = "idle", val updatedAt: String = "", val pinned: Boolean = false, val executionReady: Boolean = true, val latestAnswer: String? = null)
 @Serializable data class AgentMessage(val id: String, val sessionId: String, val role: String, val content: String, val reasoning: String? = null, val timestamp: String? = null, val finishReason: String? = null, val toolName: String? = null, val tokenCount: Int? = null)

@@ -55,7 +55,7 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
     companion object {
         suspend fun exchange(origin: String, code: String, deviceName: String): DeviceCredentials = withContext(Dispatchers.IO) {
             val json = Json { ignoreUnknownKeys = true }
-            val body = json.encodeToString(PairingRequest.serializer(), PairingRequest(code, deviceName)).toRequestBody("application/json".toMediaType())
+            val body = json.encodeToString(PairingRequest.serializer(), PairingRequest(code, deviceName, deviceKind = "android")).toRequestBody("application/json".toMediaType())
             OkHttpClient().newCall(Request.Builder().url("${origin.trimEnd('/')}/v1/pairings/exchange").post(body).build()).execute().use { response ->
                 if (!response.isSuccessful) error(response.body?.string() ?: "Pairing failed (${response.code})")
                 val paired = json.decodeFromString<PairingResponse>(response.body!!.string())
