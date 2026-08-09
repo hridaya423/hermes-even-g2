@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -105,12 +106,20 @@ class HermesClient:
             "role": role,
             "content": str(value.get("content") or ""),
             "reasoning": value.get("reasoning") or value.get("reasoning_content"),
-            "timestamp": value.get("timestamp"),
+            "timestamp": HermesClient._normalize_timestamp(value.get("timestamp")),
             "finishReason": value.get("finish_reason"),
             "toolName": value.get("tool_name"),
             "toolCalls": value.get("tool_calls"),
             "tokenCount": value.get("token_count"),
         }
+
+    @staticmethod
+    def _normalize_timestamp(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value, tz=UTC).isoformat().replace("+00:00", "Z")
+        return str(value)
 
     async def create_session(self, payload: dict[str, Any]) -> Any:
         value = await self._request("POST", "/api/sessions", json={**payload, "source": "even_g2"})

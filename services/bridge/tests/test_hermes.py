@@ -47,7 +47,7 @@ async def test_session_list_accepts_live_020_data_envelope():
 async def test_messages_normalize_live_envelope_and_paginate_newest_first():
     rows = [
         {"id": "1", "session_id": "s", "role": "user", "content": "question"},
-        {"id": "2", "session_id": "s", "role": "assistant", "content": "answer"},
+        {"id": "2", "session_id": "s", "role": "assistant", "content": "answer", "timestamp": 1700000000.5},
         {"id": "3", "session_id": "s", "role": "tool", "content": "result", "tool_name": "terminal"},
     ]
     value = HermesClient("http://hermes.test", "secret")
@@ -61,6 +61,7 @@ async def test_messages_normalize_live_envelope_and_paginate_newest_first():
     assert page["hasMore"] is True
     assert page["total"] == 3
     assert page["data"][0]["toolName"] == "terminal"
+    assert page["data"][1]["timestamp"] == "2023-11-14T22:13:20.500000Z"
     await value.close()
 
 
