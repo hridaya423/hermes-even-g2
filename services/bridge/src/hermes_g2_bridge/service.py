@@ -160,6 +160,8 @@ class ControlService:
         if kind == ActionKind.STOP_RUN:
             if not self.capabilities.get("sessionRunControl"):
                 raise ValueError("installed Hermes does not advertise native session run control")
+            if not await self.store.run_is_active(action.session_id, action.run_id):
+                raise ValueError("active run does not match this session and run")
             return await self.hermes.stop_run(action.session_id, action.run_id)
         if kind in {ActionKind.PROMPT, ActionKind.QUEUE_PROMPT}:
             text = str(action.payload.get("text", "")).strip()

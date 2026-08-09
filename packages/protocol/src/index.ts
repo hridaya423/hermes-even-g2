@@ -45,6 +45,15 @@ export type SessionSummary = {
   latestAnswer?: string;
 };
 
+export type ActiveRun = {
+  runId: string;
+  sessionId: string;
+  deviceId?: string;
+  initiatedByG2: boolean;
+  status: string;
+  updatedAt: string;
+};
+
 export type AgentMessage = {
   id: string;
   sessionId: string;

@@ -103,7 +103,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def snapshot(device=Depends(require_scope("sessions:read"))):
         probe, sessions = await asyncio.gather(service.probe(), service.sessions())
         async with store.connect() as db:
-            active = [dict(row) for row in await db.execute_fetchall("SELECT * FROM run_correlation WHERE status NOT IN ('completed','failed','cancelled')")]
+            active = [
+                {
+                    "runId": row["run_id"],
+                    "sessionId": row["session_id"],
+                    "deviceId": row["device_id"],
+                    "initiatedByG2": bool(row["initiated_by_g2"]),
+                    "status": row["status"],
+                    "updatedAt": row["updated_at"],
+                }
+                for row in await db.execute_fetchall(
+                    "SELECT * FROM run_correlation "
+                    "WHERE status NOT IN ('completed','failed','cancelled')"
+                )
+            ]
             cursor_row = await (await db.execute("SELECT COALESCE(MAX(cursor),0) AS cursor FROM events")).fetchone()
             approval_rows = await db.execute_fetchall("SELECT run_id,payload_json FROM events WHERE kind='approval.required' ORDER BY cursor DESC LIMIT 100")
             resolved_rows = await db.execute_fetchall("SELECT run_id,payload_json FROM events WHERE kind='approval.resolved'")

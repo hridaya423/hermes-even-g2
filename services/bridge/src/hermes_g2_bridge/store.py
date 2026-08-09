@@ -315,6 +315,15 @@ class Store:
             )).fetchone()
         return bool(row and row["kind"] == "run.started")
 
+    async def run_is_active(self, session_id: str, run_id: str) -> bool:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM run_correlation WHERE session_id=? AND run_id=? "
+                "AND status NOT IN ('completed','failed','cancelled')",
+                (session_id, run_id),
+            )).fetchone()
+        return row is not None
+
     async def update_run(
         self,
         run_id: str,

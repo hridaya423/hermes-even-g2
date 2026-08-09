@@ -5,6 +5,7 @@ project_dir=${0:A:h:h}
 cd "$project_dir"
 PYTHONPATH=packages/hermes-plugin services/bridge/.venv/bin/ruff check packages/hermes-plugin services/bridge
 PYTHONPATH=packages/hermes-plugin services/bridge/.venv/bin/pytest packages/hermes-plugin/tests services/bridge/tests
+npm run build -w @hermes-g2/protocol
 npm run typecheck
 npm run build
 npm test
@@ -12,6 +13,7 @@ cd "$project_dir/apps/android"
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ANDROID_HOME="$HOME/Library/Android/sdk" ./gradlew --no-daemon assembleDebug testDebugUnitTest
 swift build -c release --package-path "$project_dir/services/apple-summary-helper"
 zsh -n "$project_dir"/scripts/*.sh
+zsh "$project_dir/scripts/test-verify-release.sh"
 git -C "$project_dir" diff --check
 
 if [[ -n ${HERMES_AGENT_CHECKOUT:-} && -d ${HERMES_AGENT_CHECKOUT}/.git ]]; then

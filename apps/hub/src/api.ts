@@ -1,7 +1,7 @@
-import type { AgentAction, AgentMessage, ApprovalRequest, DurableEvent, HermesCapabilities, RuntimeReadiness, SessionSummary } from "@hermes-g2/protocol";
+import type { ActiveRun, AgentAction, AgentMessage, ApprovalRequest, DurableEvent, HermesCapabilities, RuntimeReadiness, SessionSummary } from "@hermes-g2/protocol";
 
 export type Credentials = {origin: string; deviceId: string; credential: string};
-export type Snapshot = {sessions: SessionSummary[] | {items?: SessionSummary[]}; cursor: number; runtime: RuntimeReadiness; hermes: HermesCapabilities; pendingApprovals?: ApprovalRequest[]};
+export type Snapshot = {sessions: SessionSummary[] | {items?: SessionSummary[]}; cursor: number; runtime: RuntimeReadiness; hermes: HermesCapabilities; activeRuns?: ActiveRun[]; pendingApprovals?: ApprovalRequest[]};
 
 export class BridgeApi {
   constructor(private credentials: Credentials) {}

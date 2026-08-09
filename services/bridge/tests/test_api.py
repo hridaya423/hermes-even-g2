@@ -99,3 +99,30 @@ def test_websocket_first_frame_auth_replay_and_ack(tmp_path):
                 return 0
 
             assert client.portal.call(await_acknowledgement) == event["cursor"]
+
+
+def test_snapshot_exposes_active_runs_with_versioned_camel_case_fields(tmp_path):
+    app = configured_app(tmp_path)
+    app.state.control.sessions = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        _, headers = pair(client, app)
+        client.portal.call(
+            app.state.store.update_run,
+            "run-1",
+            "session-1",
+            "device-1",
+            "started",
+            True,
+        )
+
+        response = client.get("/v1/snapshot", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["activeRuns"] == [{
+            "runId": "run-1",
+            "sessionId": "session-1",
+            "deviceId": "device-1",
+            "initiatedByG2": True,
+            "status": "started",
+            "updatedAt": response.json()["activeRuns"][0]["updatedAt"],
+        }]

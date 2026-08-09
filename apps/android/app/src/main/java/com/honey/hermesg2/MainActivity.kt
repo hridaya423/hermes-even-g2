@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             if (tab == "Jobs") JobsPane(jobs, auxiliary, onAction = { kind, jobId -> scope.launch { runCatching { client.action(AgentAction(kind, credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("jobId" to jobId))) }.onSuccess { jobs = client.jobs() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab == "Models") ModelPane(modelOptions, selected, onSelect = { provider, model -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("setSessionModel", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("provider" to provider, "model" to model))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, Modifier.padding(padding)) else if (tab == "Security") SecurityPane(devices, credentials!!.deviceId, auxiliary, onRevoke = { deviceId -> scope.launch { runCatching { client.revokeDevice(deviceId) }.onSuccess { devices = client.devices() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab != "Sessions") AuxiliaryPane(tab, auxiliary, Modifier.padding(padding)) else Row(Modifier.padding(padding).fillMaxSize()) {
                 LazyColumn(Modifier.width(320.dp).fillMaxHeight()) { item { Readiness(snapshot?.runtime, error) }; snapshot?.pendingApprovals?.firstOrNull()?.let { approval -> item { ApprovalPane(approval, snapshot!!.hermes.sessionApprovalResponse) { choice -> scope.launch { runCatching { client.action(AgentAction(mapOf("once" to "approveOnce", "session" to "approveSession", "always" to "approveAlways", "deny" to "deny").getValue(choice), credentials!!.deviceId, UUID.randomUUID().toString(), approval.sessionId, approval.runId, "awaiting_approval", Instant.now().toString(), mapOf("requestId" to approval.requestId))) }.onSuccess { snapshot = client.snapshot() }.onFailure { error = it.message } } } } }; items(snapshot?.sessions.orEmpty(), key = { it.id }) { session -> ListItem(headlineContent = { Text(session.title) }, supportingContent = { Text("${session.source} · ${session.state}") }, leadingContent = { Icon(if (session.pinned) Icons.Default.PushPin else Icons.Default.ChatBubbleOutline, null) }, modifier = Modifier.fillMaxWidth(), trailingContent = { IconButton(onClick = { selected = session }) { Icon(Icons.Default.ChevronRight, "Open") } }); HorizontalDivider() } }
                 VerticalDivider()
-                SessionPane(selected, history, prompt, { prompt = it }, onSend = { text -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction(if (session.state == "busy") "queuePrompt" else "prompt", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("text" to text))) }.onSuccess { prompt = "" }.onFailure { error = it.message } } } }, onFork = { selected?.let { session -> scope.launch { client.action(AgentAction("forkSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onRename = { title -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("renameSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("title" to title))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, onPin = { selected?.let { session -> scope.launch { client.action(AgentAction(if (session.pinned) "unpinSession" else "pinSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onSpeak = { history?.data?.firstOrNull { it.role == "assistant" }?.content?.let { text -> tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hermes-answer") } }, modifier = Modifier.weight(1f))
+                SessionPane(selected, history, prompt, { prompt = it }, onSend = { text -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction(if (session.state == "busy") "queuePrompt" else "prompt", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("text" to text))) }.onSuccess { prompt = "" }.onFailure { error = it.message } } } }, onFork = { selected?.let { session -> scope.launch { client.action(AgentAction("forkSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onRename = { title -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("renameSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("title" to title))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, onPin = { selected?.let { session -> scope.launch { client.action(AgentAction(if (session.pinned) "unpinSession" else "pinSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onSpeak = { history?.data?.firstOrNull { it.role == "assistant" }?.content?.let { text -> tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hermes-answer") } }, activeRun = selected?.let { RunControlPolicy.activeRunFor(it.id, snapshot?.activeRuns.orEmpty()) }, runControlEnabled = snapshot?.hermes?.sessionRunControl == true, onStop = { run -> scope.launch { runCatching { client.action(RunControlPolicy.stopAction(credentials!!.deviceId, run, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { snapshot = client.snapshot(); error = null }.onFailure { error = it.message } } }, modifier = Modifier.weight(1f))
             }
         }
     }
@@ -68,7 +68,65 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private fun startConnection() = ContextCompat.startForegroundService(this, Intent(this, HermesConnectionService::class.java))
     @Composable private fun Pairing(onPaired: (DeviceCredentials) -> Unit) { var origin by remember { mutableStateOf(BuildConfig.DEFAULT_BRIDGE_ORIGIN) }; var code by remember { mutableStateOf("") }; var error by remember { mutableStateOf<String?>(null) }; var busy by remember { mutableStateOf(false) }; val scope = rememberCoroutineScope(); Column(Modifier.fillMaxSize().padding(32.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) { Text("Pair private bridge", style = MaterialTheme.typography.headlineLarge); Text("Enter the 90-second, single-use code shown by `hermes-g2-bridge pair android`. A revocable Android credential is generated and encrypted in Keystore; the Hermes master key never leaves the Mac mini."); OutlinedTextField(origin, { origin = it.trimEnd('/') }, label = { Text("Tailscale HTTPS origin") }, modifier = Modifier.fillMaxWidth()); OutlinedTextField(code, { code = it.filter(Char::isDigit).take(6) }, label = { Text("Pairing code") }, modifier = Modifier.fillMaxWidth()); error?.let { Text(it, color = MaterialTheme.colorScheme.error) }; Button(enabled = !busy && origin.startsWith("https://") && code.length == 6, onClick = { busy = true; scope.launch { runCatching { BridgeClient.exchange(origin, code, Build.MODEL) }.onSuccess(onPaired).onFailure { error = it.message; busy = false } } }) { Text(if (busy) "Pairing…" else "Pair device") } } }
     @Composable private fun Readiness(value: RuntimeReadiness?, error: String?) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { Text(if (value?.coreReady == true) "Core ready" else "Core unavailable", fontWeight = FontWeight.Bold, color = if (value?.coreReady == true) Color(0xFF3A7D44) else MaterialTheme.colorScheme.error); Text(if (value?.guiReady == true) "GUI tools ready" else "GUI tools unavailable while logged out"); error?.let { Text(it, color = MaterialTheme.colorScheme.error) } } }
-    @Composable private fun SessionPane(session: SessionSummary?, history: MessagePage?, prompt: String, onPrompt: (String) -> Unit, onSend: (String) -> Unit, onFork: () -> Unit, onRename: (String) -> Unit, onPin: () -> Unit, onSpeak: () -> Unit, modifier: Modifier = Modifier) { var renaming by remember(session?.id) { mutableStateOf(false) }; var title by remember(session?.id) { mutableStateOf(session?.title.orEmpty()) }; if (renaming) AlertDialog(onDismissRequest = { renaming = false }, title = { Text("Rename exact session") }, text = { OutlinedTextField(title, { title = it.take(120) }, label = { Text("Session title") }) }, confirmButton = { Button(enabled = title.isNotBlank(), onClick = { renaming = false; onRename(title.trim()) }) { Text("Rename") } }, dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } }); Column(modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) { Text(session?.title ?: "Select a session", style = MaterialTheme.typography.headlineMedium); session?.let { Text("${it.model ?: "Default model"} · ${it.source} · ${if (it.executionReady) "Execution ready" else "UNBOUND"}"); Row { TextButton(onClick = onPin) { Text(if (it.pinned) "Unpin from G2" else "Pin to G2") }; TextButton(onClick = onFork) { Text("Fork") }; TextButton(onClick = { title = it.title; renaming = true }) { Text("Rename") }; TextButton(onClick = onSpeak, enabled = history?.data?.any { message -> message.role == "assistant" } == true) { Text("Speak") } }; LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) { items(history?.data.orEmpty().asReversed(), key = { message -> message.id }) { message -> Column { Text(message.role.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary); Text(message.content.ifBlank { "(${message.toolName ?: "empty"})" }) } } }; Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedTextField(prompt, onPrompt, label = { Text("Continue this exact session") }, modifier = Modifier.weight(1f)); IconButton(onClick = { onSend(prompt) }, enabled = prompt.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") } } } } }
+    @Composable private fun SessionPane(
+        session: SessionSummary?,
+        history: MessagePage?,
+        prompt: String,
+        onPrompt: (String) -> Unit,
+        onSend: (String) -> Unit,
+        onFork: () -> Unit,
+        onRename: (String) -> Unit,
+        onPin: () -> Unit,
+        onSpeak: () -> Unit,
+        activeRun: ActiveRun?,
+        runControlEnabled: Boolean,
+        onStop: (ActiveRun) -> Unit,
+        modifier: Modifier = Modifier,
+    ) {
+        var renaming by remember(session?.id) { mutableStateOf(false) }
+        var title by remember(session?.id) { mutableStateOf(session?.title.orEmpty()) }
+        var confirmingStop by remember(session?.id, activeRun?.runId) { mutableStateOf(false) }
+        if (renaming) AlertDialog(
+            onDismissRequest = { renaming = false },
+            title = { Text("Rename exact session") },
+            text = { OutlinedTextField(title, { title = it.take(120) }, label = { Text("Session title") }) },
+            confirmButton = { Button(enabled = title.isNotBlank(), onClick = { renaming = false; onRename(title.trim()) }) { Text("Rename") } },
+            dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } },
+        )
+        if (confirmingStop && activeRun != null && session != null) AlertDialog(
+            onDismissRequest = { confirmingStop = false },
+            title = { Text("Stop this exact run?") },
+            text = { Text("${session.title} · session ${session.id.take(8)} · run ${activeRun.runId.take(8)}. Hermes will interrupt it without rerunning automatically.") },
+            confirmButton = { Button(onClick = { confirmingStop = false; onStop(activeRun) }) { Text("Stop run") } },
+            dismissButton = { TextButton(onClick = { confirmingStop = false }) { Text("Cancel") } },
+        )
+        Column(modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text(session?.title ?: "Select a session", style = MaterialTheme.typography.headlineMedium)
+            session?.let {
+                Text("${it.model ?: "Default model"} · ${it.source} · ${if (it.executionReady) "Execution ready" else "UNBOUND"}")
+                activeRun?.let { run -> Text("Active run ${run.runId.take(8)} · ${run.status}", color = MaterialTheme.colorScheme.primary) }
+                Row {
+                    TextButton(onClick = onPin) { Text(if (it.pinned) "Unpin from G2" else "Pin to G2") }
+                    TextButton(onClick = onFork) { Text("Fork") }
+                    TextButton(onClick = { title = it.title; renaming = true }) { Text("Rename") }
+                    TextButton(onClick = onSpeak, enabled = history?.data?.any { message -> message.role == "assistant" } == true) { Text("Speak") }
+                    if (activeRun != null) TextButton(onClick = { confirmingStop = true }, enabled = runControlEnabled) { Text("Stop run") }
+                }
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(history?.data.orEmpty().asReversed(), key = { message -> message.id }) { message ->
+                        Column {
+                            Text(message.role.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                            Text(message.content.ifBlank { "(${message.toolName ?: "empty"})" })
+                        }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(prompt, onPrompt, label = { Text("Continue this exact session") }, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { onSend(prompt) }, enabled = prompt.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+                }
+            }
+        }
+    }
     @Composable private fun ApprovalPane(value: ApprovalRequest, enabled: Boolean, onChoice: (String) -> Unit) {
         var pendingChoice by remember(value.requestId) { mutableStateOf<String?>(null) }
         var confirmationStep by remember(value.requestId) { mutableIntStateOf(0) }

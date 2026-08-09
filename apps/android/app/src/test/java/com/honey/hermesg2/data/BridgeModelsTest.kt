@@ -2,6 +2,7 @@ package com.honey.hermesg2.data
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -23,6 +24,22 @@ class BridgeModelsTest {
         assertEquals("Every day", job.scheduleDisplay)
         assertEquals("2026-08-09T08:00:00Z", job.nextRunAt)
         assertEquals("completed", job.lastStatus)
+    }
+
+    @Test fun `snapshot preserves exact active run identity`() {
+        val snapshot = json.decodeFromString<Snapshot>(
+            """{"sessions":[],"activeRuns":[{"runId":"run-1","sessionId":"session-1","deviceId":"device-1","initiatedByG2":true,"status":"started","updatedAt":"2026-08-09T22:00:00Z"}]}"""
+        )
+        val encoded = json.encodeToJsonElement(Snapshot.serializer(), snapshot).jsonObject
+
+        assertEquals(
+            "run-1",
+            encoded["activeRuns"]?.jsonArray?.single()?.jsonObject?.get("runId")?.jsonPrimitive?.content,
+        )
+        assertEquals(
+            "session-1",
+            encoded["activeRuns"]?.jsonArray?.single()?.jsonObject?.get("sessionId")?.jsonPrimitive?.content,
+        )
     }
 
     @Test fun `bridge device record decodes scopes and durable cursor`() {
