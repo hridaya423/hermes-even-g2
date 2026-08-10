@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     bind_host: str = "127.0.0.1"
     bind_port: int = 8765
     database_path: Path = Path("hermes-g2.db")
+    attachments_root: Path = Path("/var/lib/hermes-g2/attachments")
+    attachment_max_bytes: int = 25 * 1024 * 1024
     hermes_origin: str = "http://127.0.0.1:8642"
     hermes_api_key: SecretStr
     external_base_path: str = "/hermes-g2"

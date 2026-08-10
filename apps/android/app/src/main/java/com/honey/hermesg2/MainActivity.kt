@@ -2,8 +2,10 @@ package com.honey.hermesg2
 
 import android.Manifest
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -52,21 +54,49 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         var devices by remember { mutableStateOf<List<DeviceRecord>?>(null) }
         var modelOptions by remember { mutableStateOf<ModelOptions?>(null) }
         var skillsInventory by remember { mutableStateOf<SkillsInventory?>(null) }
+        var pendingAttachments by remember { mutableStateOf<List<AttachmentUpload>>(emptyList()) }
+        var attachmentTargetSessionId by remember { mutableStateOf<String?>(null) }
         val scope = rememberCoroutineScope()
         val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+        val attachmentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            val targetSessionId = attachmentTargetSessionId
+            if (targetSessionId != null && uris.isNotEmpty()) scope.launch {
+                runCatching {
+                    uris.take(10 - pendingAttachments.size).map { uri ->
+                        val local = readAttachment(uri)
+                        client.uploadAttachment(targetSessionId, local.name, local.mediaType, local.bytes)
+                    }
+                }.onSuccess { uploaded ->
+                    pendingAttachments = (pendingAttachments + uploaded).take(10)
+                    error = null
+                }.onFailure { error = it.message }
+            }
+        }
         LaunchedEffect(Unit) { if (Build.VERSION.SDK_INT >= 33) notifications.launch(Manifest.permission.POST_NOTIFICATIONS); startConnection(); runCatching { client.snapshot() }.onSuccess { snapshot = it; selected = it.sessions.firstOrNull { session -> session.id == deepLinkSession } ?: it.sessions.firstOrNull() }.onFailure { error = it.message } }
         LaunchedEffect(tab) { auxiliary = when (tab) { "Jobs" -> { jobs = if (snapshot?.hermes?.jobs == true) runCatching { client.jobs() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.jobs == true) "" else "Jobs are not advertised by this Hermes build." }; "Models" -> { modelOptions = if (snapshot?.hermes?.models == true) runCatching { client.modelOptions() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.models == true) "" else "Model options are unavailable." }; "Skills" -> { skillsInventory = if (snapshot?.hermes?.skills == true) runCatching { client.skills() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.skills == true) "" else "Skills are not advertised by this Hermes build." }; "Security" -> { devices = runCatching { client.devices() }.getOrElse { error = it.message; null }; runCatching { client.audit() }.getOrElse { it.message.orEmpty() } }; else -> "" } }
-        LaunchedEffect(selected?.id) { history = selected?.let { session -> runCatching { client.messages(session.id) }.getOrElse { error = it.message; null } } }
+        LaunchedEffect(selected?.id) { pendingAttachments = emptyList(); history = selected?.let { session -> runCatching { client.messages(session.id) }.getOrElse { error = it.message; null } } }
         Scaffold(topBar = { TopAppBar(title = { Text("Hermes G2") }, actions = { TextButton(onClick = { scope.launch { client.action(AgentAction("createSession", credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("title" to "G2 session"))); snapshot = client.snapshot() } }) { Text("New session") }; IconButton(onClick = { scope.launch { snapshot = client.snapshot() } }) { Icon(Icons.Default.Refresh, "Refresh") } }) }, bottomBar = { NavigationBar { listOf("Sessions" to Icons.AutoMirrored.Filled.Chat, "Jobs" to Icons.Default.Schedule, "Models" to Icons.Default.Tune, "Skills" to Icons.Default.Build, "Security" to Icons.Default.Security).forEach { (name, icon) -> NavigationBarItem(tab == name, { tab = name }, { Icon(icon, name) }, label = { Text(name) }) } } }) { padding ->
             if (tab == "Jobs") JobsPane(jobs, auxiliary, onAction = { kind, jobId -> scope.launch { runCatching { client.action(AgentAction(kind, credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("jobId" to jobId))) }.onSuccess { jobs = client.jobs() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab == "Models") ModelPane(modelOptions, selected, onSelect = { provider, model -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("setSessionModel", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("provider" to provider, "model" to model))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, Modifier.padding(padding)) else if (tab == "Skills") SkillsPane(skillsInventory, auxiliary, Modifier.padding(padding)) else if (tab == "Security") SecurityPane(devices, credentials!!.deviceId, auxiliary, onRevoke = { deviceId -> scope.launch { runCatching { client.revokeDevice(deviceId) }.onSuccess { devices = client.devices() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab != "Sessions") AuxiliaryPane(tab, auxiliary, Modifier.padding(padding)) else Row(Modifier.padding(padding).fillMaxSize()) {
                 LazyColumn(Modifier.width(320.dp).fillMaxHeight()) { item { Readiness(snapshot?.runtime, error) }; snapshot?.pendingApprovals?.firstOrNull()?.let { approval -> item { ApprovalPane(approval, snapshot!!.hermes.sessionApprovalResponse) { choice -> scope.launch { runCatching { client.action(AgentAction(mapOf("once" to "approveOnce", "session" to "approveSession", "always" to "approveAlways", "deny" to "deny").getValue(choice), credentials!!.deviceId, UUID.randomUUID().toString(), approval.sessionId, approval.runId, "awaiting_approval", Instant.now().toString(), mapOf("requestId" to approval.requestId))) }.onSuccess { snapshot = client.snapshot() }.onFailure { error = it.message } } } } }; items(snapshot?.sessions.orEmpty(), key = { it.id }) { session -> ListItem(headlineContent = { Text(session.title) }, supportingContent = { Text("${session.source} · ${session.state}") }, leadingContent = { Icon(if (session.pinned) Icons.Default.PushPin else Icons.Default.ChatBubbleOutline, null) }, modifier = Modifier.fillMaxWidth(), trailingContent = { IconButton(onClick = { selected = session }) { Icon(Icons.Default.ChevronRight, "Open") } }); HorizontalDivider() } }
                 VerticalDivider()
-                SessionPane(selected, history, prompt, { prompt = it }, onSend = { text -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction(if (session.state == "busy") "queuePrompt" else "prompt", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("text" to text))) }.onSuccess { prompt = "" }.onFailure { error = it.message } } } }, onFork = { selected?.let { session -> scope.launch { client.action(AgentAction("forkSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onRename = { title -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("renameSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("title" to title))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, onPin = { selected?.let { session -> scope.launch { client.action(AgentAction(if (session.pinned) "unpinSession" else "pinSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onSpeak = { history?.data?.firstOrNull { it.role == "assistant" }?.content?.let { text -> tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hermes-answer") } }, activeRun = selected?.let { RunControlPolicy.activeRunFor(it.id, snapshot?.activeRuns.orEmpty()) }, runControlEnabled = snapshot?.hermes?.sessionRunControl == true, onStop = { run -> scope.launch { runCatching { client.action(RunControlPolicy.stopAction(credentials!!.deviceId, run, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { snapshot = client.snapshot(); error = null }.onFailure { error = it.message } } }, modifier = Modifier.weight(1f))
+                SessionPane(selected, history, prompt, { prompt = it }, pendingAttachments, onAttach = { session -> attachmentTargetSessionId = session.id; attachmentPicker.launch(arrayOf("*/*")) }, onRemoveAttachment = { attachmentId -> pendingAttachments = pendingAttachments.filterNot { it.attachmentId == attachmentId } }, onSend = { text -> selected?.let { session -> scope.launch { runCatching { client.action(AttachmentPromptPolicy.promptAction(credentials!!.deviceId, session.id, session.state == "busy", text, pendingAttachments, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { prompt = ""; pendingAttachments = emptyList() }.onFailure { error = it.message } } } }, onFork = { selected?.let { session -> scope.launch { client.action(AgentAction("forkSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onRename = { title -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("renameSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("title" to title))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, onPin = { selected?.let { session -> scope.launch { client.action(AgentAction(if (session.pinned) "unpinSession" else "pinSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onSpeak = { history?.data?.firstOrNull { it.role == "assistant" }?.content?.let { text -> tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hermes-answer") } }, activeRun = selected?.let { RunControlPolicy.activeRunFor(it.id, snapshot?.activeRuns.orEmpty()) }, runControlEnabled = snapshot?.hermes?.sessionRunControl == true, onStop = { run -> scope.launch { runCatching { client.action(RunControlPolicy.stopAction(credentials!!.deviceId, run, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { snapshot = client.snapshot(); error = null }.onFailure { error = it.message } } }, modifier = Modifier.weight(1f))
             }
         }
     }
 
     private fun startConnection() = ContextCompat.startForegroundService(this, Intent(this, HermesConnectionService::class.java))
+    private data class LocalAttachment(val name: String, val mediaType: String, val bytes: ByteArray)
+    private fun readAttachment(uri: Uri): LocalAttachment {
+        var name = "attachment"
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) name = cursor.getString(0) ?: name
+        }
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readNBytes(25 * 1024 * 1024 + 1) }
+            ?: error("Unable to open attachment")
+        require(bytes.isNotEmpty()) { "Attachment is empty" }
+        require(bytes.size <= 25 * 1024 * 1024) { "Attachment exceeds 25 MB" }
+        return LocalAttachment(name, contentResolver.getType(uri) ?: "application/octet-stream", bytes)
+    }
     @Composable private fun Pairing(onPaired: (DeviceCredentials) -> Unit) { var origin by remember { mutableStateOf(BuildConfig.DEFAULT_BRIDGE_ORIGIN) }; var code by remember { mutableStateOf("") }; var error by remember { mutableStateOf<String?>(null) }; var busy by remember { mutableStateOf(false) }; val scope = rememberCoroutineScope(); Column(Modifier.fillMaxSize().padding(32.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) { Text("Pair private bridge", style = MaterialTheme.typography.headlineLarge); Text("Enter the 90-second, single-use code shown by `hermes-g2-bridge pair android`. A revocable Android credential is generated and encrypted in Keystore; the Hermes master key never leaves the Mac mini."); OutlinedTextField(origin, { origin = it.trimEnd('/') }, label = { Text("Tailscale HTTPS origin") }, modifier = Modifier.fillMaxWidth()); OutlinedTextField(code, { code = it.filter(Char::isDigit).take(6) }, label = { Text("Pairing code") }, modifier = Modifier.fillMaxWidth()); error?.let { Text(it, color = MaterialTheme.colorScheme.error) }; Button(enabled = !busy && origin.startsWith("https://") && code.length == 6, onClick = { busy = true; scope.launch { runCatching { BridgeClient.exchange(origin, code, Build.MODEL) }.onSuccess(onPaired).onFailure { error = it.message; busy = false } } }) { Text(if (busy) "Pairing…" else "Pair device") } } }
     @Composable private fun Readiness(value: RuntimeReadiness?, error: String?) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { Text(if (value?.coreReady == true) "Core ready" else "Core unavailable", fontWeight = FontWeight.Bold, color = if (value?.coreReady == true) Color(0xFF3A7D44) else MaterialTheme.colorScheme.error); Text(if (value?.guiReady == true) "GUI tools ready" else "GUI tools unavailable while logged out"); error?.let { Text(it, color = MaterialTheme.colorScheme.error) } } }
     @Composable private fun SessionPane(
@@ -74,6 +104,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         history: MessagePage?,
         prompt: String,
         onPrompt: (String) -> Unit,
+        attachments: List<AttachmentUpload>,
+        onAttach: (SessionSummary) -> Unit,
+        onRemoveAttachment: (String) -> Unit,
         onSend: (String) -> Unit,
         onFork: () -> Unit,
         onRename: (String) -> Unit,
@@ -121,9 +154,19 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         }
                     }
                 }
+                if (attachments.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    attachments.forEach { attachment ->
+                        InputChip(
+                            selected = true,
+                            onClick = { onRemoveAttachment(attachment.attachmentId) },
+                            label = { Text("${attachment.name} · remove") },
+                        )
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(prompt, onPrompt, label = { Text("Continue this exact session") }, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { onSend(prompt) }, enabled = prompt.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+                    IconButton(onClick = { onAttach(it) }, enabled = attachments.size < 10) { Icon(Icons.Default.AttachFile, "Attach files") }
+                    IconButton(onClick = { onSend(prompt) }, enabled = prompt.isNotBlank() || attachments.isNotEmpty()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
                 }
             }
         }

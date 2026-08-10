@@ -14,6 +14,7 @@ def configured_app(tmp_path):
     app = create_app(Settings(
         hermes_api_key="test-only-master-key",
         database_path=tmp_path / "bridge.db",
+        attachments_root=tmp_path / "attachments",
         whisper_binary=tmp_path / "whisper-cli",
         whisper_model=tmp_path / "model.bin",
     ))
@@ -63,6 +64,34 @@ def test_pairing_auth_and_idempotent_action(tmp_path):
 
         changed = {**action, "payload": {"different": True}}
         assert client.post("/v1/actions", headers=headers, json=changed).status_code == 409
+
+
+def test_attachment_upload_is_private_session_bound_and_content_addressed(tmp_path):
+    app = configured_app(tmp_path)
+    with TestClient(app) as client:
+        _, headers = pair(client, app, "android")
+
+        assert client.post(
+            "/v1/attachments?sessionId=session-1",
+            files={"file": ("photo.png", b"not-really-a-png", "image/png")},
+        ).status_code == 401
+
+        response = client.post(
+            "/v1/attachments?sessionId=session-1",
+            headers=headers,
+            files={"file": ("photo.png", b"not-really-a-png", "image/png")},
+        )
+
+        assert response.status_code == 201
+        value = response.json()
+        assert value["sessionId"] == "session-1"
+        assert value["name"] == "photo.png"
+        assert value["mediaType"] == "image/png"
+        assert value["size"] == len(b"not-really-a-png")
+        assert len(value["sha256"]) == 64
+        staged = [path for path in (tmp_path / "attachments").rglob("*") if path.is_file()]
+        assert len(staged) == 1
+        assert staged[0].read_bytes() == b"not-really-a-png"
 
 
 def test_websocket_first_frame_auth_replay_and_ack(tmp_path):

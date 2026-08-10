@@ -1,15 +1,22 @@
 import asyncio
+import hashlib
 import json
 import logging
+import os
+import re
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import (
     Depends,
     FastAPI,
+    File,
     Header,
     HTTPException,
     Query,
     Request,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -240,6 +247,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except SpeechError as error:
             raise HTTPException(422, str(error)) from error
         return {**result, "sessionId": session_id}
+
+    @app.post("/v1/attachments", status_code=201)
+    async def upload_attachment(
+        session_id: str = Query(alias="sessionId", min_length=1, max_length=256),
+        file: UploadFile = File(...),
+        device=Depends(require_scope("attachments:write")),
+    ):
+        original_name = file.filename or "attachment"
+        safe_name = re.sub(r"[\x00-\x1f\x7f]", "", os.path.basename(original_name)).strip()
+        if not safe_name or safe_name in {".", ".."}:
+            raise HTTPException(422, "attachment filename is invalid")
+        content = await file.read(config.attachment_max_bytes + 1)
+        await file.close()
+        if not content:
+            raise HTTPException(422, "attachment is empty")
+        if len(content) > config.attachment_max_bytes:
+            raise HTTPException(413, "attachment exceeds the configured size limit")
+
+        attachment_id = str(uuid.uuid4())
+        session_bucket = hashlib.sha256(session_id.encode()).hexdigest()[:24]
+        suffix = Path(safe_name).suffix[:16]
+        directory = config.attachments_root / session_bucket
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / f"{attachment_id}{suffix}"
+        path.write_bytes(content)
+        path.chmod(0o600)
+        digest = hashlib.sha256(content).hexdigest()
+        media_type = file.content_type or "application/octet-stream"
+        await store.record_attachment(
+            attachment_id,
+            device["id"],
+            session_id,
+            safe_name,
+            media_type,
+            path,
+            digest,
+            len(content),
+        )
+        await store.audit(
+            device["id"],
+            "uploadAttachment",
+            session_id,
+            None,
+            "completed",
+            {"attachment": attachment_id[:8], "size": len(content), "mediaType": media_type},
+        )
+        return {
+            "attachmentId": attachment_id,
+            "sessionId": session_id,
+            "name": safe_name,
+            "mediaType": media_type,
+            "size": len(content),
+            "sha256": digest,
+        }
 
     @app.get("/v1/events/replay")
     async def event_replay(

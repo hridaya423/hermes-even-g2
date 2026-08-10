@@ -11,6 +11,8 @@ The boot path uses LaunchDaemons because core Hermes chat must work without an A
 7. Run `hermes-g2-bridge doctor` without copying its secret environment into a shell history.
 8. Run `scripts/audit-mac-mini.sh` after repairs or reboots. It is read-only and reports whether the Hermes patch is applied, the observer is active, core services are reachable, Tailscale is running, and the system LaunchDaemon is loaded; it never restarts Hermes or changes credentials.
 
+Before a bridge upgrade, run `hermes-g2-bridge backup --output <offline-path>`. To restore, stop `system/com.honey.hermes-g2.bridge`, run `hermes-g2-bridge restore --input <offline-path> --confirm`, then bootstrap the service again. The restore transaction never replaces device credentials, and the command rejects backups that contain any credential rows.
+
 GUI-dependent tools remain unavailable while the Mac mini is logged out. The bridge exposes this separately from core readiness; it does not restart or silently rerun a failed turn.
 
 For pre-production testing without administrator access, run `scripts/stage-mac-mini-user.sh`. It creates an isolated bridge venv and credential file under `~/.hermes/hermes-g2`, installs only a user LaunchAgent, and leaves the Hermes checkout and Hermes Mini untouched. This tier stops at logout, so it cannot satisfy the boot-without-login acceptance test; migrate it with `install-mac-mini.sh` once an administrator is present.

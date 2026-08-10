@@ -143,10 +143,10 @@ class HermesClient:
             json={"provider": provider, "model": model},
         )
 
-    async def stream_prompt(self, session_id: str, text: str, options: dict[str, Any] | None = None) -> AsyncIterator[dict[str, Any]]:
+    async def stream_prompt(self, session_id: str, message: Any, options: dict[str, Any] | None = None) -> AsyncIterator[dict[str, Any]]:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            async with self.client.stream("POST", f"/api/sessions/{session_id}/chat/stream", json={"message": text, **(options or {})}, timeout=None) as response:
+            async with self.client.stream("POST", f"/api/sessions/{session_id}/chat/stream", json={"message": message, **(options or {})}, timeout=None) as response:
                 if response.is_error:
                     body = (await response.aread()).decode(errors="replace")
                     raise HermesError(f"session stream failed with {response.status_code}: {body[:300]}")

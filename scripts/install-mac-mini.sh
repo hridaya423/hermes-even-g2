@@ -18,6 +18,7 @@ if [[ -n $invoking_user && $invoking_user != root ]]; then
 fi
 
 install -d -m 0755 "$install_root" "$state_root" "$state_root/models" "$log_root"
+install -d -m 0700 "$state_root/attachments"
 install -d -m 0700 "$config_root"
 if [[ ! -f "$config_root/bridge.env" ]]; then
   if [[ -n $staged_root && -f "$staged_root/bridge.env" ]]; then
@@ -38,6 +39,7 @@ for required in ("HERMES_G2_HERMES_API_KEY", "HERMES_G2_PLUGIN_SECRET"):
         raise SystemExit(f"{required} is missing from the staged environment")
 values.update(
     HERMES_G2_DATABASE_PATH="/var/lib/hermes-g2/hermes-g2.db",
+    HERMES_G2_ATTACHMENTS_ROOT="/var/lib/hermes-g2/attachments",
     HERMES_G2_WHISPER_MODEL="/var/lib/hermes-g2/models/ggml-tiny.en-q5_1.bin",
     HERMES_G2_SUMMARY_HELPER="/opt/hermes-g2/bin/hermes-g2-summary",
 )

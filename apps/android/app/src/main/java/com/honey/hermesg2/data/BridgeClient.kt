@@ -4,6 +4,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -26,6 +28,30 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
     suspend fun skills(): SkillsInventory = get("/v1/skills")
     suspend fun audit(): String = raw("/v1/audit")
     suspend fun devices(): List<DeviceRecord> = get("/v1/devices")
+    suspend fun uploadAttachment(
+        sessionId: String,
+        name: String,
+        mediaType: String,
+        bytes: ByteArray,
+    ): AttachmentUpload = withContext(Dispatchers.IO) {
+        val url = credentials.origin.toHttpUrl().newBuilder()
+            .addPathSegments("v1/attachments")
+            .addQueryParameter("sessionId", sessionId)
+            .build()
+        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("file", name, bytes.toRequestBody(mediaType.toMediaType()))
+            .build()
+        client.newCall(
+            Request.Builder().url(url)
+                .header("Authorization", "Bearer ${credentials.credential}")
+                .header("X-Device-Id", credentials.deviceId)
+                .post(body)
+                .build()
+        ).execute().use { response ->
+            if (!response.isSuccessful) error(response.body?.string() ?: "Bridge ${response.code}")
+            json.decodeFromString(response.body!!.string())
+        }
+    }
     suspend fun revokeDevice(deviceId: String): String = withContext(Dispatchers.IO) {
         client.newCall(request("/v1/devices/$deviceId/revoke").post(ByteArray(0).toRequestBody(null)).build()).execute().use { response ->
             if (!response.isSuccessful) error(response.body?.string() ?: "Bridge ${response.code}")

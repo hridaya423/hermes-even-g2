@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import json
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from .hermes import HermesClient
@@ -81,7 +83,7 @@ class ControlService:
             if session_id and session.get("state") == "idle" and not await self.store.session_turn_active(session_id):
                 queued = await self.store.dequeue_prompt(session_id)
                 if queued:
-                    self._start_prompt(session_id, queued["text"], queued["deviceId"], queued.get("options"))
+                    self._start_prompt(session_id, queued["message"], queued["deviceId"], queued.get("options"))
         return changed
 
     async def sessions(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
@@ -165,16 +167,31 @@ class ControlService:
             return await self.hermes.stop_run(action.session_id, action.run_id)
         if kind in {ActionKind.PROMPT, ActionKind.QUEUE_PROMPT}:
             text = str(action.payload.get("text", "")).strip()
-            if not text:
+            raw_attachment_ids = action.payload.get("attachmentIds", [])
+            if isinstance(raw_attachment_ids, str):
+                attachment_ids = [value.strip() for value in raw_attachment_ids.split(",") if value.strip()]
+            elif isinstance(raw_attachment_ids, list):
+                attachment_ids = [str(value).strip() for value in raw_attachment_ids if str(value).strip()]
+            else:
+                raise ValueError("attachmentIds must be a list or comma-separated string")
+            if len(attachment_ids) > 10:
+                raise ValueError("a prompt may include at most 10 attachments")
+            if not text and not attachment_ids:
                 raise ValueError("prompt text is empty")
+            message = await self.prepare_prompt(
+                action.session_id,
+                device["id"],
+                text or "Please inspect the attached file.",
+                attachment_ids,
+            )
             sessions = await self.sessions(limit=100)
             target = next((item for item in sessions if item["id"] == action.session_id), None)
             should_queue = kind == ActionKind.QUEUE_PROMPT or target is None or await self.store.session_is_busy(action.session_id)
             if should_queue:
-                position = await self.store.enqueue_prompt(action.session_id, {"text": text, "deviceId": device["id"], "options": action.payload.get("options"), "createdAt": action.created_at.isoformat()})
+                position = await self.store.enqueue_prompt(action.session_id, {"message": message, "deviceId": device["id"], "options": action.payload.get("options"), "createdAt": action.created_at.isoformat()})
                 await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload={"state": "queued", "queuePosition": position}))
                 return {"status": "queued", "sessionId": action.session_id, "position": position}
-            self._start_prompt(action.session_id, text, device["id"], action.payload.get("options"))
+            self._start_prompt(action.session_id, message, device["id"], action.payload.get("options"))
             return {"status": "started", "sessionId": action.session_id}
         if kind in {ActionKind.RUN_JOB, ActionKind.PAUSE_JOB, ActionKind.RESUME_JOB}:
             if not self.capabilities.get("jobs"):
@@ -183,16 +200,50 @@ class ControlService:
             return await self.hermes.job_action(str(action.payload["jobId"]), verb)
         raise ValueError(f"unsupported action {kind}")
 
-    def _start_prompt(self, session_id: str, text: str, device_id: str, options: dict | None) -> None:
-        task = asyncio.create_task(self._run_prompt(session_id, text, device_id, options))
+    async def prepare_prompt(
+        self,
+        session_id: str,
+        device_id: str,
+        text: str,
+        attachment_ids: list[str],
+    ) -> str | list[dict[str, Any]]:
+        attachments = await self.store.claim_attachments(device_id, session_id, attachment_ids)
+        if not attachments:
+            return text
+        document_lines = [
+            f"- {item['name']}: {item['path']}"
+            for item in attachments
+            if not item["mediaType"].startswith("image/")
+        ]
+        prompt_text = text
+        if document_lines:
+            prompt_text += "\n\nAttached files staged on this Mac for this session:\n" + "\n".join(document_lines)
+        image_parts = []
+        for item in attachments:
+            if not item["mediaType"].startswith("image/"):
+                continue
+            encoded = base64.b64encode(Path(item["path"]).read_bytes()).decode()
+            image_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{item['mediaType']};base64,{encoded}",
+                    "detail": "auto",
+                },
+            })
+        if not image_parts:
+            return prompt_text
+        return [{"type": "text", "text": prompt_text}, *image_parts]
+
+    def _start_prompt(self, session_id: str, message: Any, device_id: str, options: dict | None) -> None:
+        task = asyncio.create_task(self._run_prompt(session_id, message, device_id, options))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _run_prompt(self, session_id: str, text: str, device_id: str, options: dict | None) -> None:
+    async def _run_prompt(self, session_id: str, message: Any, device_id: str, options: dict | None) -> None:
         run_id = None
         provider_failure = None
         try:
-            async for raw in self.hermes.stream_prompt(session_id, text, options):
+            async for raw in self.hermes.stream_prompt(session_id, message, options):
                 kind = raw.get("type", raw.get("event", "run.progress"))
                 run_id = raw.get("run_id", raw.get("runId", run_id))
                 if kind == "assistant.completed":

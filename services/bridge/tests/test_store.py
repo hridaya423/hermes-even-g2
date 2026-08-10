@@ -24,6 +24,40 @@ async def test_pairing_is_single_use_and_credentials_are_hashed(store):
     assert credential not in row["credential_hash"]
 
 
+@pytest.mark.asyncio
+async def test_attachment_claim_is_atomic_device_and_session_bound(store, tmp_path):
+    path = tmp_path / "private-upload.pdf"
+    path.write_bytes(b"document")
+    await store.record_attachment(
+        "attachment-1",
+        "device-a",
+        "session-a",
+        "report.pdf",
+        "application/pdf",
+        path,
+        "digest",
+        8,
+    )
+
+    with pytest.raises(ValueError, match="not available"):
+        await store.claim_attachments("device-b", "session-a", ["attachment-1"])
+    with pytest.raises(ValueError, match="not available"):
+        await store.claim_attachments("device-a", "session-b", ["attachment-1"])
+
+    claimed = await store.claim_attachments("device-a", "session-a", ["attachment-1"])
+    assert claimed == [{
+        "attachmentId": "attachment-1",
+        "name": "report.pdf",
+        "mediaType": "application/pdf",
+        "path": str(path),
+        "sha256": "digest",
+        "size": 8,
+    }]
+
+    with pytest.raises(ValueError, match="not available"):
+        await store.claim_attachments("device-a", "session-a", ["attachment-1"])
+
+
 async def test_migrations_are_idempotent(store):
     await store.migrate()
     async with store.connect() as database:
@@ -47,7 +81,7 @@ async def test_migration_recovers_when_column_committed_before_marker(tmp_path):
             "SELECT version FROM schema_migrations ORDER BY version"
         )
         columns = await database.execute_fetchall("PRAGMA table_info(session_state)")
-    assert [row["version"] for row in versions] == [1, 2]
+    assert [row["version"] for row in versions] == [1, 2, 3]
     assert "source_override" in {row["name"] for row in columns}
 
 

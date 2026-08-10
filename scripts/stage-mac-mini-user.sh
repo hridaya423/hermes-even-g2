@@ -16,7 +16,8 @@ if [[ ! -x $agent_python ]]; then
   exit 2
 fi
 
-mkdir -p "$install_root" "$state_root/models" "$log_root" "$HOME/Library/LaunchAgents"
+mkdir -p "$install_root" "$state_root/models" "$state_root/attachments" "$log_root" "$HOME/Library/LaunchAgents"
+chmod 0700 "$state_root/attachments"
 rsync -a --delete --exclude .venv --exclude .pytest_cache --exclude .ruff_cache --exclude __pycache__ \
   "$project_dir/services/bridge/" "$install_root/bridge/"
 
@@ -65,6 +66,7 @@ values = {
     "HERMES_G2_HERMES_API_KEY": api_key,
     "HERMES_G2_PLUGIN_SECRET": existing.get("HERMES_G2_PLUGIN_SECRET", secrets.token_urlsafe(48)),
     "HERMES_G2_DATABASE_PATH": str(runtime / "state" / "hermes-g2.db"),
+    "HERMES_G2_ATTACHMENTS_ROOT": str(runtime / "state" / "attachments"),
     "HERMES_G2_WHISPER_BINARY": "/opt/homebrew/bin/whisper-cli",
     "HERMES_G2_WHISPER_MODEL": str(runtime / "state" / "models" / "ggml-tiny.en-q5_1.bin"),
     "HERMES_G2_BIND_HOST": "127.0.0.1",

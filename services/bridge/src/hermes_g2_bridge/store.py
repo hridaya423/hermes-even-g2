@@ -61,6 +61,15 @@ MIGRATIONS = [
     """
     ALTER TABLE session_state ADD COLUMN source_override TEXT;
     """,
+    """
+    CREATE TABLE IF NOT EXISTS attachments(
+      id TEXT PRIMARY KEY, device_id TEXT NOT NULL, session_id TEXT NOT NULL,
+      name TEXT NOT NULL, media_type TEXT NOT NULL, path TEXT NOT NULL,
+      sha256 TEXT NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL,
+      consumed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS attachments_session ON attachments(session_id, created_at);
+    """,
 ]
 
 
@@ -160,6 +169,78 @@ class Store:
         except VerifyMismatchError:
             return None
         return {"id": row["id"], "kind": row["kind"], "scopes": json.loads(row["scopes_json"])}
+
+    async def record_attachment(
+        self,
+        attachment_id: str,
+        device_id: str,
+        session_id: str,
+        name: str,
+        media_type: str,
+        path: Path,
+        digest: str,
+        size: int,
+    ) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO attachments VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+                (
+                    attachment_id,
+                    device_id,
+                    session_id,
+                    name,
+                    media_type,
+                    str(path),
+                    digest,
+                    size,
+                    utc_now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+    async def claim_attachments(
+        self,
+        device_id: str,
+        session_id: str,
+        attachment_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        if not attachment_ids:
+            return []
+        if len(attachment_ids) != len(set(attachment_ids)):
+            raise ValueError("attachment IDs must be unique")
+        placeholders = ",".join("?" for _ in attachment_ids)
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            rows = await db.execute_fetchall(
+                f"SELECT * FROM attachments WHERE id IN ({placeholders}) "
+                "AND device_id=? AND session_id=? AND consumed_at IS NULL",
+                [*attachment_ids, device_id, session_id],
+            )
+            by_id = {row["id"]: row for row in rows}
+            if len(by_id) != len(attachment_ids) or any(
+                not Path(by_id[attachment_id]["path"]).is_file()
+                for attachment_id in attachment_ids
+                if attachment_id in by_id
+            ):
+                await db.rollback()
+                raise ValueError("one or more attachments are not available for this device and session")
+            claimed_at = utc_now().isoformat()
+            await db.execute(
+                f"UPDATE attachments SET consumed_at=? WHERE id IN ({placeholders})",
+                [claimed_at, *attachment_ids],
+            )
+            await db.commit()
+        return [
+            {
+                "attachmentId": row["id"],
+                "name": row["name"],
+                "mediaType": row["media_type"],
+                "path": row["path"],
+                "sha256": row["sha256"],
+                "size": row["size"],
+            }
+            for row in (by_id[attachment_id] for attachment_id in attachment_ids)
+        ]
 
     async def append_event(self, event: EventInput) -> dict[str, Any]:
         event_id = str(uuid.uuid4())

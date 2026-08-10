@@ -67,6 +67,15 @@ export type AgentMessage = {
   tokenCount?: number;
 };
 
+export type AttachmentUpload = {
+  attachmentId: string;
+  sessionId: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  sha256: string;
+};
+
 export type ApprovalChoice = "once" | "session" | "always" | "deny";
 
 export type ApprovalRequest = {

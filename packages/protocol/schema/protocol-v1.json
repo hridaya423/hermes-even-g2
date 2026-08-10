@@ -6,6 +6,19 @@
   "required": ["protocolVersion"],
   "properties": {"protocolVersion": {"const": "1.0"}},
   "$defs": {
+    "attachmentUpload": {
+      "type": "object",
+      "required": ["attachmentId", "sessionId", "name", "mediaType", "size", "sha256"],
+      "properties": {
+        "attachmentId": {"type": "string", "minLength": 1},
+        "sessionId": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "mediaType": {"type": "string", "minLength": 1},
+        "size": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      },
+      "additionalProperties": false
+    },
     "action": {
       "type": "object",
       "required": ["kind", "deviceId", "idempotencyKey", "createdAt", "payload"],

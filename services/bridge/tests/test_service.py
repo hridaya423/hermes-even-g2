@@ -1,3 +1,4 @@
+import base64
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -119,3 +120,38 @@ async def test_stop_run_routes_to_the_exact_active_session_and_run(tmp_path: Pat
 
     assert response == {"status": "stopping"}
     assert hermes.stopped == ("session-a", "run-1")
+
+
+@pytest.mark.asyncio
+async def test_prepare_prompt_claims_exact_attachments_and_builds_native_image_input(tmp_path: Path):
+    store, _, service = await configured_control(tmp_path)
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image-bytes")
+    document = tmp_path / "notes.pdf"
+    document.write_bytes(b"document-bytes")
+    await store.record_attachment("image-1", "device", "session-a", "image.png", "image/png", image, "a", 11)
+    await store.record_attachment("doc-1", "device", "session-a", "notes.pdf", "application/pdf", document, "b", 14)
+
+    content = await service.prepare_prompt(
+        "session-a",
+        "device",
+        "Summarise these",
+        ["image-1", "doc-1"],
+    )
+
+    assert content == [
+        {
+            "type": "text",
+            "text": f"Summarise these\n\nAttached files staged on this Mac for this session:\n- notes.pdf: {document}",
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(b"image-bytes").decode(),
+                "detail": "auto",
+            },
+        },
+    ]
+
+    with pytest.raises(ValueError, match="not available"):
+        await service.prepare_prompt("session-b", "device", "wrong session", ["image-1"])
