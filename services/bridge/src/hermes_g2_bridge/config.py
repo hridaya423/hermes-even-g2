@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     database_path: Path = Path("hermes-g2.db")
     attachments_root: Path = Path("/var/lib/hermes-g2/attachments")
     attachment_max_bytes: int = 25 * 1024 * 1024
+    attachment_device_quota_bytes: int = 100 * 1024 * 1024
+    attachment_total_quota_bytes: int = 1024 * 1024 * 1024
+    attachment_ttl_seconds: int = 24 * 60 * 60
+    attachment_chunk_bytes: int = 1024 * 1024
     hermes_origin: str = "http://127.0.0.1:8642"
     hermes_api_key: SecretStr
     external_base_path: str = "/hermes-g2"

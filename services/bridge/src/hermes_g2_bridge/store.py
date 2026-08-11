@@ -70,6 +70,11 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS attachments_session ON attachments(session_id, created_at);
     """,
+    """
+    ALTER TABLE attachments ADD COLUMN expires_at TEXT;
+    UPDATE attachments SET expires_at=strftime('%Y-%m-%dT%H:%M:%f+00:00', created_at, '+1 day') WHERE expires_at IS NULL;
+    CREATE INDEX IF NOT EXISTS attachments_expiry ON attachments(expires_at);
+    """,
 ]
 
 
@@ -116,6 +121,17 @@ class Store:
                         for row in await db.execute_fetchall("PRAGMA table_info(session_state)")
                     }
                     if "source_override" in columns:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)",
+                            (index,),
+                        )
+                        continue
+                if index == 4:
+                    columns = {
+                        row["name"]
+                        for row in await db.execute_fetchall("PRAGMA table_info(attachments)")
+                    }
+                    if "expires_at" in columns:
                         await db.execute(
                             "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)",
                             (index,),
@@ -180,10 +196,29 @@ class Store:
         path: Path,
         digest: str,
         size: int,
+        *,
+        ttl_seconds: int = 24 * 60 * 60,
+        device_quota_bytes: int | None = None,
+        total_quota_bytes: int | None = None,
     ) -> None:
+        expires_at = (utc_now() + timedelta(seconds=ttl_seconds)).isoformat()
         async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            device_usage = await (await db.execute(
+                "SELECT COALESCE(SUM(size),0) usage FROM attachments WHERE device_id=? AND consumed_at IS NULL",
+                (device_id,),
+            )).fetchone()
+            total_usage = await (await db.execute(
+                "SELECT COALESCE(SUM(size),0) usage FROM attachments WHERE consumed_at IS NULL"
+            )).fetchone()
+            if device_quota_bytes is not None and device_usage["usage"] + size > device_quota_bytes:
+                await db.rollback()
+                raise ValueError("device attachment quota exceeded")
+            if total_quota_bytes is not None and total_usage["usage"] + size > total_quota_bytes:
+                await db.rollback()
+                raise ValueError("bridge attachment quota exceeded")
             await db.execute(
-                "INSERT INTO attachments VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+                "INSERT INTO attachments(id,device_id,session_id,name,media_type,path,sha256,size,created_at,consumed_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,NULL,?)",
                 (
                     attachment_id,
                     device_id,
@@ -194,9 +229,47 @@ class Store:
                     digest,
                     size,
                     utc_now().isoformat(),
+                    expires_at,
                 ),
             )
             await db.commit()
+
+    async def cleanup_attachments(self) -> int:
+        now = utc_now().isoformat()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            rows = await db.execute_fetchall(
+                "SELECT id,path FROM attachments WHERE expires_at IS NOT NULL AND expires_at<=?",
+                (now,),
+            )
+            if rows:
+                placeholders = ",".join("?" for _ in rows)
+                await db.execute(
+                    f"DELETE FROM attachments WHERE id IN ({placeholders})",
+                    [row["id"] for row in rows],
+                )
+            await db.commit()
+        for row in rows:
+            Path(row["path"]).unlink(missing_ok=True)
+        return len(rows)
+
+    async def delete_consumed_attachments(self, session_id: str) -> int:
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            rows = await db.execute_fetchall(
+                "SELECT id,path FROM attachments WHERE session_id=? AND consumed_at IS NOT NULL",
+                (session_id,),
+            )
+            if rows:
+                placeholders = ",".join("?" for _ in rows)
+                await db.execute(
+                    f"DELETE FROM attachments WHERE id IN ({placeholders})",
+                    [row["id"] for row in rows],
+                )
+            await db.commit()
+        for row in rows:
+            Path(row["path"]).unlink(missing_ok=True)
+        return len(rows)
 
     async def claim_attachments(
         self,
@@ -213,8 +286,9 @@ class Store:
             await db.execute("BEGIN IMMEDIATE")
             rows = await db.execute_fetchall(
                 f"SELECT * FROM attachments WHERE id IN ({placeholders}) "
-                "AND device_id=? AND session_id=? AND consumed_at IS NULL",
-                [*attachment_ids, device_id, session_id],
+                "AND device_id=? AND session_id=? AND consumed_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at>?)",
+                [*attachment_ids, device_id, session_id, utc_now().isoformat()],
             )
             by_id = {row["id"]: row for row in rows}
             if len(by_id) != len(attachment_ids) or any(
@@ -261,8 +335,24 @@ class Store:
             rows = await db.execute_fetchall("SELECT * FROM events WHERE cursor>? ORDER BY cursor LIMIT ?", (cursor, limit))
         return [{"protocolVersion": row["protocol_version"], "eventId": row["event_id"], "cursor": row["cursor"], "kind": row["kind"], "timestamp": row["timestamp"], "source": row["source"], "sessionId": row["session_id"], "runId": row["run_id"], "payload": json.loads(row["payload_json"])} for row in rows]
 
+    async def event_bounds(self) -> tuple[int, int]:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT COALESCE(MIN(cursor),0) oldest, COALESCE(MAX(cursor),0) latest FROM events"
+            )).fetchone()
+        return int(row["oldest"]), int(row["latest"])
+
     async def event_stream(self, after: int) -> AsyncIterator[dict[str, Any]]:
         cursor = after
+        oldest, latest = await self.event_bounds()
+        if after > 0 and oldest > 0 and after < oldest - 1:
+            yield {
+                "type": "replay.gap",
+                "cursor": after,
+                "oldestCursor": oldest,
+                "latestCursor": latest,
+                "requiresSnapshot": True,
+            }
         while True:
             events = await self.events_after(cursor)
             if events:

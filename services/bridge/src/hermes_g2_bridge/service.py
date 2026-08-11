@@ -297,6 +297,8 @@ class ControlService:
                 await self.store.update_run(run_id, session_id, device_id, "failed", True)
             await self.store.append_event(EventInput(kind="run.failed", source="bridge", sessionId=session_id, runId=run_id, payload={"error": str(error)[:500]}))
             await self.store.audit(device_id, "prompt", session_id, run_id, "failed", {"errorType": type(error).__name__})
+        finally:
+            await self.store.delete_consumed_attachments(session_id)
 
 
 EVENT_KINDS = {"runtime.updated", "session.created", "session.updated", "message.completed", "run.started", "run.progress", "run.completed", "run.failed", "run.cancelled", "tool.started", "tool.completed", "tool.failed", "approval.required", "approval.resolved", "subagent.started", "subagent.completed", "job.updated", "attention.created", "attention.resolved"}

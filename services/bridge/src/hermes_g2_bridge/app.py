@@ -67,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await store.migrate()
+        await store.cleanup_attachments()
         await service.probe()
         async def reconcile():
             while True:
@@ -74,6 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await service.probe()
                     await service.reconcile_once()
                     await store.compact_events(config.event_retention_days, config.event_retention_floor)
+                    await store.cleanup_attachments()
                 except Exception as error:
                     logger.warning("Hermes reconciliation failed: %s", type(error).__name__)
                 await asyncio.sleep(15)
@@ -254,51 +256,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
         device=Depends(require_scope("attachments:write")),
     ):
+        sessions = await service.sessions(limit=100)
+        if not any(str(session.get("id")) == session_id for session in sessions):
+            raise HTTPException(404, "target session does not exist")
+        await store.cleanup_attachments()
         original_name = file.filename or "attachment"
         safe_name = re.sub(r"[\x00-\x1f\x7f]", "", os.path.basename(original_name)).strip()
         if not safe_name or safe_name in {".", ".."}:
             raise HTTPException(422, "attachment filename is invalid")
-        content = await file.read(config.attachment_max_bytes + 1)
-        await file.close()
-        if not content:
-            raise HTTPException(422, "attachment is empty")
-        if len(content) > config.attachment_max_bytes:
-            raise HTTPException(413, "attachment exceeds the configured size limit")
-
         attachment_id = str(uuid.uuid4())
         session_bucket = hashlib.sha256(session_id.encode()).hexdigest()[:24]
         suffix = Path(safe_name).suffix[:16]
         directory = config.attachments_root / session_bucket
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = directory / f"{attachment_id}{suffix}"
-        path.write_bytes(content)
-        path.chmod(0o600)
-        digest = hashlib.sha256(content).hexdigest()
         media_type = file.content_type or "application/octet-stream"
-        await store.record_attachment(
-            attachment_id,
-            device["id"],
-            session_id,
-            safe_name,
-            media_type,
-            path,
-            digest,
-            len(content),
-        )
+        digest_state = hashlib.sha256()
+        size = 0
+        try:
+            with path.open("xb") as output:
+                path.chmod(0o600)
+                while chunk := await file.read(config.attachment_chunk_bytes):
+                    size += len(chunk)
+                    if size > config.attachment_max_bytes:
+                        raise HTTPException(413, "attachment exceeds the configured size limit")
+                    digest_state.update(chunk)
+                    output.write(chunk)
+            if size == 0:
+                raise HTTPException(422, "attachment is empty")
+            digest = digest_state.hexdigest()
+            try:
+                await store.record_attachment(
+                    attachment_id,
+                    device["id"],
+                    session_id,
+                    safe_name,
+                    media_type,
+                    path,
+                    digest,
+                    size,
+                    ttl_seconds=config.attachment_ttl_seconds,
+                    device_quota_bytes=config.attachment_device_quota_bytes,
+                    total_quota_bytes=config.attachment_total_quota_bytes,
+                )
+            except ValueError as error:
+                raise HTTPException(413, str(error)) from error
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            await file.close()
         await store.audit(
             device["id"],
             "uploadAttachment",
             session_id,
             None,
             "completed",
-            {"attachment": attachment_id[:8], "size": len(content), "mediaType": media_type},
+            {"attachment": attachment_id[:8], "size": size, "mediaType": media_type},
         )
         return {
             "attachmentId": attachment_id,
             "sessionId": session_id,
             "name": safe_name,
             "mediaType": media_type,
-            "size": len(content),
+            "size": size,
             "sha256": digest,
         }
 
@@ -310,10 +331,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         rows = await store.events_after(after, limit + 1)
         events = rows[:limit]
+        oldest, latest = await store.event_bounds()
+        requires_snapshot = after > 0 and oldest > 0 and after < oldest - 1
         return {
             "events": events,
             "nextCursor": events[-1]["cursor"] if events else after,
             "hasMore": len(rows) > limit,
+            "oldestCursor": oldest,
+            "latestCursor": latest,
+            "requiresSnapshot": requires_snapshot,
         }
 
     @app.get("/v1/events")

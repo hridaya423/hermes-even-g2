@@ -58,6 +58,29 @@ async def test_attachment_claim_is_atomic_device_and_session_bound(store, tmp_pa
         await store.claim_attachments("device-a", "session-a", ["attachment-1"])
 
 
+@pytest.mark.asyncio
+async def test_attachment_record_enforces_atomic_quotas(store, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"12345678")
+    second.write_bytes(b"abcdefgh")
+    await store.record_attachment("one", "device", "session", "one.txt", "text/plain", first, "a", 8, device_quota_bytes=12, total_quota_bytes=100)
+    with pytest.raises(ValueError, match="device attachment quota"):
+        await store.record_attachment("two", "device", "session", "two.txt", "text/plain", second, "b", 8, device_quota_bytes=12, total_quota_bytes=100)
+
+
+@pytest.mark.asyncio
+async def test_attachment_cleanup_deletes_expired_rows_and_files(store, tmp_path):
+    path = tmp_path / "expired"
+    path.write_bytes(b"old")
+    await store.record_attachment("expired", "device", "session", "old.txt", "text/plain", path, "digest", 3, ttl_seconds=-1)
+    assert await store.cleanup_attachments() == 1
+    assert not path.exists()
+    async with store.connect() as database:
+        row = await (await database.execute("SELECT COUNT(*) count FROM attachments")).fetchone()
+    assert row["count"] == 0
+
+
 async def test_migrations_are_idempotent(store):
     await store.migrate()
     async with store.connect() as database:
@@ -81,7 +104,7 @@ async def test_migration_recovers_when_column_committed_before_marker(tmp_path):
             "SELECT version FROM schema_migrations ORDER BY version"
         )
         columns = await database.execute_fetchall("PRAGMA table_info(session_state)")
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
     assert "source_override" in {row["name"] for row in columns}
 
 
