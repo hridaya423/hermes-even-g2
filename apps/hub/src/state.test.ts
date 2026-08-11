@@ -1,13 +1,32 @@
 import {describe, expect, it} from "vitest";
-import {beginRecording, bindTranscript, cycleSession, type ViewState} from "./state";
+import {beginRecording, bindTranscript, cycleSession, loadHubPersistence, persistViewState, setReadingPosition, type StorageLike, type ViewState} from "./state";
 import * as stateModule from "./state";
 
 const initial: ViewState = {sessions: [{id: "a", title: "A", source: "desktop", executionReady: true, state: "idle", updatedAt: "2026-01-01", pinned: true}, {id: "b", title: "B", source: "telegram", executionReady: true, state: "idle", updatedAt: "2026-01-02", pinned: false}], selected: 0, mode: "default", detailPage: 0, decisionIndex: 0, connected: true, cursor: 0, pending: [], activeRuns: [], latestEvents: {}, history: {}};
 
 describe("immutable prompt routing", () => {
-  it("captures the visible session before recording", () => expect(beginRecording(initial).recordingSessionId).toBe("a"));
+  it("captures the visible session before recording", () => {
+    const next = beginRecording(initial);
+    expect(next.recordingSessionId).toBe("a");
+    expect(next.transcriptDestination).toBe("a");
+  });
   it("rejects a transcript returned for another session", () => expect(() => bindTranscript(beginRecording(initial), {text: "hello", duration: 1, sessionId: "b"})).toThrow());
   it("cycles sessions only in navigation", () => expect(cycleSession(initial, -1).sessions[cycleSession(initial, -1).selected].id).toBe("b"));
+  it("keeps a detail reading position with its exact session", () => {
+    const next = setReadingPosition({...initial, mode: "detail"}, 2);
+    expect(next.detailPage).toBe(2);
+    expect(next.readingPositions).toEqual({a: 2});
+    expect(cycleSession(next, 1).detailPage).toBe(0);
+    expect(cycleSession({...next, readingPositions: {a: 2, b: 3}}, 1).detailPage).toBe(3);
+  });
+  it("clears a persisted transcript destination only when the review is discarded", () => {
+    const values = new Map<string, string>();
+    const storage: StorageLike = {getItem: (key) => values.get(key) ?? null, setItem: (key, value) => { values.set(key, value); }, removeItem: (key) => { values.delete(key); }};
+    persistViewState(beginRecording(initial), storage);
+    expect(loadHubPersistence(storage).transcriptDestination).toBe("a");
+    persistViewState({...initial, transcriptDestination: undefined, recordingSessionId: undefined}, storage);
+    expect(loadHubPersistence(storage).transcriptDestination).toBeUndefined();
+  });
 });
 
 describe("deliberate run cancellation", () => {
