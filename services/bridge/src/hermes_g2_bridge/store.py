@@ -253,17 +253,23 @@ class Store:
             Path(row["path"]).unlink(missing_ok=True)
         return len(rows)
 
-    async def delete_consumed_attachments(self, session_id: str) -> int:
+    async def delete_consumed_attachments(
+        self, session_id: str, attachment_ids: list[str]
+    ) -> int:
+        if not attachment_ids:
+            return 0
+        placeholders = ",".join("?" for _ in attachment_ids)
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             rows = await db.execute_fetchall(
-                "SELECT id,path FROM attachments WHERE session_id=? AND consumed_at IS NOT NULL",
-                (session_id,),
+                f"SELECT id,path FROM attachments WHERE session_id=? AND consumed_at IS NOT NULL "
+                f"AND id IN ({placeholders})",
+                [session_id, *attachment_ids],
             )
             if rows:
-                placeholders = ",".join("?" for _ in rows)
+                claimed_placeholders = ",".join("?" for _ in rows)
                 await db.execute(
-                    f"DELETE FROM attachments WHERE id IN ({placeholders})",
+                    f"DELETE FROM attachments WHERE id IN ({claimed_placeholders})",
                     [row["id"] for row in rows],
                 )
             await db.commit()

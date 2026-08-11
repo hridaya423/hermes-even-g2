@@ -83,7 +83,15 @@ class ControlService:
             if session_id and session.get("state") == "idle" and not await self.store.session_turn_active(session_id):
                 queued = await self.store.dequeue_prompt(session_id)
                 if queued:
-                    self._start_prompt(session_id, queued["message"], queued["deviceId"], queued.get("options"))
+                    legacy_prepared = "message" in queued
+                    self._start_prompt(
+                        session_id,
+                        queued.get("message", queued.get("text", "")),
+                        queued["deviceId"],
+                        queued.get("options"),
+                        queued.get("attachmentIds", []),
+                        prepared=legacy_prepared,
+                    )
         return changed
 
     async def sessions(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
@@ -178,20 +186,26 @@ class ControlService:
                 raise ValueError("a prompt may include at most 10 attachments")
             if not text and not attachment_ids:
                 raise ValueError("prompt text is empty")
-            message = await self.prepare_prompt(
-                action.session_id,
-                device["id"],
-                text or "Please inspect the attached file.",
-                attachment_ids,
-            )
             sessions = await self.sessions(limit=100)
             target = next((item for item in sessions if item["id"] == action.session_id), None)
             should_queue = kind == ActionKind.QUEUE_PROMPT or target is None or await self.store.session_is_busy(action.session_id)
             if should_queue:
-                position = await self.store.enqueue_prompt(action.session_id, {"message": message, "deviceId": device["id"], "options": action.payload.get("options"), "createdAt": action.created_at.isoformat()})
+                position = await self.store.enqueue_prompt(action.session_id, {
+                    "text": text or "Please inspect the attached file.",
+                    "attachmentIds": attachment_ids,
+                    "deviceId": device["id"],
+                    "options": action.payload.get("options"),
+                    "createdAt": action.created_at.isoformat(),
+                })
                 await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload={"state": "queued", "queuePosition": position}))
                 return {"status": "queued", "sessionId": action.session_id, "position": position}
-            self._start_prompt(action.session_id, message, device["id"], action.payload.get("options"))
+            self._start_prompt(
+                action.session_id,
+                text or "Please inspect the attached file.",
+                device["id"],
+                action.payload.get("options"),
+                attachment_ids,
+            )
             return {"status": "started", "sessionId": action.session_id}
         if kind in {ActionKind.RUN_JOB, ActionKind.PAUSE_JOB, ActionKind.RESUME_JOB}:
             if not self.capabilities.get("jobs"):
@@ -234,15 +248,49 @@ class ControlService:
             return prompt_text
         return [{"type": "text", "text": prompt_text}, *image_parts]
 
-    def _start_prompt(self, session_id: str, message: Any, device_id: str, options: dict | None) -> None:
-        task = asyncio.create_task(self._run_prompt(session_id, message, device_id, options))
+    def _start_prompt(
+        self,
+        session_id: str,
+        message: Any,
+        device_id: str,
+        options: dict | None,
+        attachment_ids: list[str],
+        *,
+        prepared: bool = False,
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_prompt(
+                session_id,
+                message,
+                device_id,
+                options,
+                attachment_ids,
+                prepared=prepared,
+            )
+        )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _run_prompt(self, session_id: str, message: Any, device_id: str, options: dict | None) -> None:
+    async def _run_prompt(
+        self,
+        session_id: str,
+        message: Any,
+        device_id: str,
+        options: dict | None,
+        attachment_ids: list[str],
+        *,
+        prepared: bool = False,
+    ) -> None:
         run_id = None
         provider_failure = None
         try:
+            if not prepared:
+                message = await self.prepare_prompt(
+                    session_id,
+                    device_id,
+                    str(message),
+                    attachment_ids,
+                )
             async for raw in self.hermes.stream_prompt(session_id, message, options):
                 kind = raw.get("type", raw.get("event", "run.progress"))
                 run_id = raw.get("run_id", raw.get("runId", run_id))
@@ -298,7 +346,7 @@ class ControlService:
             await self.store.append_event(EventInput(kind="run.failed", source="bridge", sessionId=session_id, runId=run_id, payload={"error": str(error)[:500]}))
             await self.store.audit(device_id, "prompt", session_id, run_id, "failed", {"errorType": type(error).__name__})
         finally:
-            await self.store.delete_consumed_attachments(session_id)
+            await self.store.delete_consumed_attachments(session_id, attachment_ids)
 
 
 EVENT_KINDS = {"runtime.updated", "session.created", "session.updated", "message.completed", "run.started", "run.progress", "run.completed", "run.failed", "run.cancelled", "tool.started", "tool.completed", "tool.failed", "approval.required", "approval.resolved", "subagent.started", "subagent.completed", "job.updated", "attention.created", "attention.resolved"}

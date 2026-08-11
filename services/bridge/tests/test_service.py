@@ -1,6 +1,7 @@
 import base64
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -155,3 +156,38 @@ async def test_prepare_prompt_claims_exact_attachments_and_builds_native_image_i
 
     with pytest.raises(ValueError, match="not available"):
         await service.prepare_prompt("session-b", "device", "wrong session", ["image-1"])
+
+
+@pytest.mark.asyncio
+async def test_queued_prompt_defers_attachment_claim_until_run_start(tmp_path: Path):
+    store, _, service = await configured_control(tmp_path)
+    attachment = tmp_path / "queued.pdf"
+    attachment.write_bytes(b"queued-document")
+    await store.record_attachment(
+        "queued-1", "device", "session-a", "queued.pdf", "application/pdf",
+        attachment, "digest", len(b"queued-document"),
+    )
+    service.sessions = AsyncMock(return_value=[{"id": "session-a", "state": "busy"}])
+    action = AgentAction(
+        kind="queuePrompt",
+        deviceId="device",
+        idempotencyKey="queue-with-file",
+        sessionId="session-a",
+        createdAt=datetime.now(UTC),
+        payload={"text": "Use this later", "attachmentIds": ["queued-1"]},
+    )
+
+    response = await service.execute(
+        action,
+        {"id": "device", "scopes": ["sessions:write"]},
+    )
+
+    assert response["status"] == "queued"
+    queued = await store.dequeue_prompt("session-a")
+    assert queued["attachmentIds"] == ["queued-1"]
+    async with store.connect() as database:
+        row = await (await database.execute(
+            "SELECT consumed_at FROM attachments WHERE id='queued-1'"
+        )).fetchone()
+    assert row["consumed_at"] is None
+    assert attachment.exists()
