@@ -57,7 +57,7 @@ class Context:
     def register_hook(self, name, callback):
         registered.append(name)
 plugin.register(Context())
-expected = {"pre_approval_request", "post_approval_response", "session_start", "session_end"}
+expected = {"pre_approval_request", "post_approval_response", "on_session_start", "on_session_end"}
 print("active" if expected.issubset(registered) else "staged")
 PY
 )

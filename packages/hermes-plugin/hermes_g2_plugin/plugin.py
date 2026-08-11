@@ -1,4 +1,7 @@
 import os
+import queue
+import threading
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -7,9 +10,76 @@ import httpx
 class HermesG2Observer:
     """Fail-open Hermes hook observer. It never executes actions or delays Hermes."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        sender: Callable[[dict[str, Any]], None] | None = None,
+        queue_size: int = 256,
+    ) -> None:
         self.origin = os.environ.get("HERMES_G2_PLUGIN_ORIGIN", "http://127.0.0.1:8765")
         self.secret = os.environ.get("HERMES_G2_PLUGIN_SECRET", "")
+        self._sender = sender
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
+            maxsize=max(1, queue_size)
+        )
+        self._dropped = 0
+        self._thread: threading.Thread | None = None
+        if self.secret:
+            self._thread = threading.Thread(
+                target=self._deliver,
+                name="hermes-g2-observer",
+                daemon=True,
+            )
+            self._thread.start()
+
+    @property
+    def pending_count(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped
+
+    def close(self) -> None:
+        if not self._thread:
+            return
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                return
+        self._thread.join(timeout=1)
+
+    def _deliver(self) -> None:
+        client = None if self._sender else httpx.Client(timeout=0.75)
+        try:
+            while True:
+                envelope = self._queue.get()
+                try:
+                    if envelope is None:
+                        return
+                    if self._sender:
+                        self._sender(envelope)
+                    elif client:
+                        client.post(
+                            f"{self.origin}/internal/plugin/events",
+                            headers={"X-Plugin-Secret": self.secret},
+                            json=envelope,
+                        )
+                except Exception:  # noqa: BLE001, S110 -- observation stays fail-open
+                    pass
+                finally:
+                    self._queue.task_done()
+        finally:
+            if client:
+                client.close()
 
     def _send(self, kind: str, kwargs: dict[str, Any]) -> None:
         if not self.secret:
@@ -28,15 +98,23 @@ class HermesG2Observer:
             "surface": kwargs.get("surface"),
             "errorType": type(kwargs["error"]).__name__ if kwargs.get("error") else None,
         }
+        envelope = {
+            "kind": self._event_kind(kind),
+            "source": "plugin",
+            "sessionId": session_id,
+            "runId": run_id,
+            "payload": safe,
+        }
         try:
-            with httpx.Client(timeout=0.75) as client:
-                client.post(
-                    f"{self.origin}/internal/plugin/events",
-                    headers={"X-Plugin-Secret": self.secret},
-                    json={"kind": self._event_kind(kind), "source": "plugin", "sessionId": session_id, "runId": run_id, "payload": safe},
-                )
-        except Exception:  # noqa: BLE001 -- observation must never break an agent turn
-            return
+            self._queue.put_nowait(envelope)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self._dropped += 1
+                self._queue.put_nowait(envelope)
+            except (queue.Empty, queue.Full):
+                self._dropped += 1
 
     @staticmethod
     def _run_id(kwargs: dict[str, Any]) -> str | None:
