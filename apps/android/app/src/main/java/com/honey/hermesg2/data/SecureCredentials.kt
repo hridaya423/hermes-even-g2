@@ -18,7 +18,10 @@ class SecureCredentials(private val context: Context) {
     fun save(value: DeviceCredentials) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
         val encrypted = cipher.doFinal(Json.encodeToString(DeviceCredentials.serializer(), value).encodeToByteArray())
-        preferences.edit().putString("ciphertext", Base64.encodeToString(encrypted, Base64.NO_WRAP)).putString("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP)).apply()
+        check(preferences.edit()
+            .putString("ciphertext", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+            .putString("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .commit()) { "Unable to persist paired device credential" }
     }
 
     fun load(): DeviceCredentials? = runCatching {
@@ -28,7 +31,7 @@ class SecureCredentials(private val context: Context) {
         Json.decodeFromString(DeviceCredentials.serializer(), cipher.doFinal(encrypted).decodeToString())
     }.getOrNull()
 
-    fun clear() = preferences.edit().clear().apply()
+    fun clear() = preferences.edit().clear().commit()
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }
@@ -37,4 +40,3 @@ class SecureCredentials(private val context: Context) {
         }.generateKey()
     }
 }
-

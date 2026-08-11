@@ -119,11 +119,22 @@ class HermesConnectionService : Service() {
             repeat(12) {
                 val replay = runCatching { bridge.replayEvents(cursor.get()) }.getOrNull()
                 if (replay != null) {
+                    if (replay.requiresSnapshot) {
+                        runCatching { bridge.snapshot() }.onSuccess { snapshot ->
+                            cursor.set(snapshot.cursor)
+                            durableCursor.persistBeforeAcknowledge(snapshot.cursor)
+                        }
+                        delay(250)
+                        return@repeat
+                    }
                     replay.events.forEach { event ->
                         handleEvent(json.encodeToString(DurableEvent.serializer(), event))
                     }
                     if (replay.events.isNotEmpty()) acknowledge(bridge, replay.nextCursor, "poll-${replay.nextCursor}")
-                    if (replay.hasMore) return@repeat
+                    if (replay.hasMore) {
+                        delay(100)
+                        return@repeat
+                    }
                 }
                 delay(5_000)
             }
