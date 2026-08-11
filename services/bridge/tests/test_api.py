@@ -70,6 +70,26 @@ def test_pairing_auth_and_idempotent_action(tmp_path):
         assert client.post("/v1/actions", headers=headers, json=changed).status_code == 409
 
 
+def test_hub_can_revoke_only_its_own_device(tmp_path):
+    app = configured_app(tmp_path)
+    with TestClient(app) as client:
+        hub, hub_headers = pair(client, app, "hub")
+        other, _ = pair(client, app, "hub")
+
+        forbidden = client.post(
+            f"/v1/devices/{other['deviceId']}/revoke",
+            headers=hub_headers,
+        )
+        assert forbidden.status_code == 403
+
+        revoked = client.post(
+            f"/v1/devices/{hub['deviceId']}/revoke",
+            headers=hub_headers,
+        )
+        assert revoked.status_code == 200
+        assert client.get("/v1/snapshot", headers=hub_headers).status_code == 401
+
+
 def test_attachment_upload_is_private_session_bound_and_content_addressed(tmp_path):
     app = configured_app(tmp_path)
     with TestClient(app) as client:

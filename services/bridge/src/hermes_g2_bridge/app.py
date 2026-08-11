@@ -199,7 +199,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [{**dict(row), "scopes": json.loads(row["scopes_json"])} for row in rows]
 
     @app.post("/v1/devices/{device_id}/revoke")
-    async def revoke(device_id: str, device=Depends(require_scope("devices:manage"))):
+    async def revoke(device_id: str, device=Depends(require_scope("sessions:read"))):
+        if device_id != device["id"] and "devices:manage" not in device["scopes"]:
+            raise HTTPException(403, "device may only revoke itself")
         async with store.connect() as db:
             await db.execute("UPDATE devices SET revoked_at=? WHERE id=?", (utc_now().isoformat(), device_id))
             await db.commit()
