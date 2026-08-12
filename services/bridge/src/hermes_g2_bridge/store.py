@@ -609,7 +609,7 @@ class Store:
         async with self.connect() as db:
             row = await (await db.execute(
                 "SELECT 1 FROM run_correlation WHERE session_id=? AND run_id=? "
-                "AND status NOT IN ('completed','failed','cancelled')",
+                "AND status NOT IN ('completed','failed','cancelled','interrupted')",
                 (session_id, run_id),
             )).fetchone()
         return row is not None
@@ -859,23 +859,203 @@ class Store:
             await db.commit()
 
     async def recover_prompt_admissions(self) -> list[dict[str, Any]]:
-        """Mark pre-crash admissions interrupted; callers can surface a retry affordance."""
+        """Mark pre-crash admissions interrupted; callers can surface a retry affordance.
+
+        This compatibility name is kept for older callers.  New startup code uses
+        :meth:`recover_inflight_prompts`, which also repairs the denormalized queue
+        mirror and writes a durable attention event in the same transaction.
+        """
+        return await self.recover_inflight_prompts()
+
+    async def recover_inflight_prompts(self) -> list[dict[str, Any]]:
+        """Recover work that was admitted before a bridge process restart.
+
+        Prompt delivery is deliberately at-least-once at the persistence boundary:
+        rows are retained as ``interrupted`` and never started automatically after a
+        restart.  The session-state queue is a read model of ``prompt_queue`` and is
+        rebuilt while the rows are locked, so a crash cannot leave a ghost prompt or
+        silently remove a queued continuation.  Recovery attention events are written
+        in that same transaction, making the restart visible to every reconnecting
+        device even if the process exits immediately afterwards.
+        """
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             rows = await db.execute_fetchall(
-                "SELECT * FROM prompt_queue WHERE status IN ('admitted','claimed')"
+                "SELECT * FROM prompt_queue WHERE status IN ('admitted','claimed','running') ORDER BY created_at"
             )
+            states = await db.execute_fetchall(
+                "SELECT session_id,active_run_id,active_admission_id FROM session_state "
+                "WHERE active_run_id IS NOT NULL OR active_admission_id IS NOT NULL"
+            )
+            now = utc_now().isoformat()
             if rows:
                 await db.execute(
-                    "UPDATE prompt_queue SET status='interrupted',updated_at=? WHERE status IN ('admitted','claimed')",
-                    (utc_now().isoformat(),),
+                    "UPDATE prompt_queue SET status='interrupted',updated_at=? "
+                    "WHERE status IN ('admitted','claimed','running')",
+                    (now,),
                 )
+
+            # Clear both admission and provider-run mirrors.  The run correlation is
+            # kept for audit/history but made terminal so it cannot block a retry.
+            for state in states:
+                if state["active_run_id"]:
+                    await db.execute(
+                        "UPDATE run_correlation SET status='interrupted',updated_at=? "
+                        "WHERE run_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')",
+                        (now, state["active_run_id"]),
+                    )
                 await db.execute(
-                    "UPDATE session_state SET active_admission_id=NULL,active_admission_at=NULL,updated_at=? WHERE active_admission_id IS NOT NULL",
-                    (utc_now().isoformat(),),
+                    "UPDATE session_state SET active_run_id=NULL,active_admission_id=NULL,"
+                    "active_admission_at=NULL,updated_at=? WHERE session_id=?",
+                    (now, state["session_id"]),
                 )
+
+            # Rebuild the denormalized list from the durable queue table for every
+            # touched session, including sessions whose only inconsistency was a
+            # stale mirror from an earlier version of the bridge.
+            session_ids = {
+                row["session_id"] for row in rows
+            } | {
+                row["session_id"] for row in states
+            }
+            for session_id in session_ids:
+                queued_rows = await db.execute_fetchall(
+                    "SELECT payload_json FROM prompt_queue WHERE session_id=? AND status='queued' "
+                    "ORDER BY created_at",
+                    (session_id,),
+                )
+                queued = [json.loads(row["payload_json"]) for row in queued_rows]
+                await db.execute(
+                    "INSERT INTO session_state(session_id,queued_prompts_json,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET queued_prompts_json=excluded.queued_prompts_json,"
+                    "updated_at=excluded.updated_at",
+                    (session_id, json.dumps(queued, separators=(",", ":")), now),
+                )
+
+            # Insert recovery events before committing state.  Payloads intentionally
+            # contain no prompt text, command, attachment, or other private content;
+            # the durable queue row remains available for an explicit retry action.
+            recovery = []
+            state_by_session = {state["session_id"]: state for state in states}
+            for row in rows:
+                event_id = str(uuid.uuid4())
+                timestamp = utc_now().isoformat()
+                payload = {
+                    "kind": "promptInterrupted",
+                    "queueId": row["id"],
+                    "reason": "bridge restarted before delivery",
+                    "retryable": True,
+                }
+                state = state_by_session.get(row["session_id"])
+                cursor = (await db.execute(
+                    "INSERT INTO events(event_id,protocol_version,kind,timestamp,source,session_id,run_id,payload_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        event_id,
+                        "1.0",
+                        "attention.created",
+                        timestamp,
+                        "bridge",
+                        row["session_id"],
+                        state["active_run_id"] if state else None,
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )).lastrowid
+                recovery.append({
+                    "queueId": row["id"],
+                    "sessionId": row["session_id"],
+                    "eventId": event_id,
+                    "cursor": cursor,
+                    "status": "interrupted",
+                })
+
+            # State rows without a durable queue row still need an attention item;
+            # otherwise a client that only listens for attention would miss recovery.
+            queued_session_ids = {row["session_id"] for row in rows}
+            for state in states:
+                if state["session_id"] in queued_session_ids:
+                    continue
+                if state["active_run_id"]:
+                    kind = "runInterrupted"
+                    identity = {"runId": state["active_run_id"]}
+                    run_id = state["active_run_id"]
+                    reason = "bridge restarted while the run was active"
+                elif state["active_admission_id"]:
+                    kind = "promptInterrupted"
+                    identity = {"admissionId": state["active_admission_id"]}
+                    run_id = None
+                    reason = "bridge restarted before delivery"
+                else:
+                    continue
+                event_id = str(uuid.uuid4())
+                timestamp = utc_now().isoformat()
+                payload = {
+                    "kind": kind,
+                    **identity,
+                    "reason": reason,
+                    "retryable": True,
+                }
+                cursor = (await db.execute(
+                    "INSERT INTO events(event_id,protocol_version,kind,timestamp,source,session_id,run_id,payload_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        event_id,
+                        "1.0",
+                        "attention.created",
+                        timestamp,
+                        "bridge",
+                        state["session_id"],
+                        run_id,
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )).lastrowid
+                recovery.append({
+                    "sessionId": state["session_id"],
+                    **identity,
+                    "eventId": event_id,
+                    "cursor": cursor,
+                    "status": "interrupted",
+                })
+
+            # A provider run may have been active without a corresponding queue row
+            # (for example an externally inserted run or a crash after bind). Surface
+            # that stopped state as a separate durable attention event.
+            for state in states:
+                if not state["active_run_id"]:
+                    continue
+                event_id = str(uuid.uuid4())
+                timestamp = utc_now().isoformat()
+                payload = {
+                    "status": "interrupted",
+                    "reason": "bridge restarted while the run was active",
+                }
+                cursor = (await db.execute(
+                    "INSERT INTO events(event_id,protocol_version,kind,timestamp,source,session_id,run_id,payload_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        event_id,
+                        "1.0",
+                        "run.cancelled",
+                        timestamp,
+                        "bridge",
+                        state["session_id"],
+                        state["active_run_id"],
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )).lastrowid
+                recovery.append({
+                    "sessionId": state["session_id"],
+                    "runId": state["active_run_id"],
+                    "eventId": event_id,
+                    "cursor": cursor,
+                    "status": "interrupted",
+                })
+                continue
             await db.commit()
-        return [json.loads(row["payload_json"]) | {"queueId": row["id"]} for row in rows]
+        if recovery:
+            async with self._condition:
+                self._condition.notify_all()
+        return recovery
 
     async def list_queued_prompts(self, session_id: str) -> list[dict[str, Any]]:
         async with self.connect() as db:

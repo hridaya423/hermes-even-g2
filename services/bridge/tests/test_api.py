@@ -257,6 +257,32 @@ def test_event_replay_reports_compaction_gap(tmp_path):
         assert response.json()["latestCursor"] == 4
 
 
+def test_plugin_events_use_the_same_strict_projection_as_managed_runs(tmp_path):
+    app = configured_app(tmp_path, plugin_secret="plugin-secret")
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/plugin/events",
+            headers={"X-Plugin-Secret": "plugin-secret"},
+            json={
+                "kind": "tool.completed",
+                "source": "plugin",
+                "sessionId": "session-1",
+                "payload": {
+                    "tool_name": "shell",
+                    "command": "cat /Users/alice/private.txt",
+                    "metadata": {"token": "drop"},
+                    "nested": {"secret": "drop"},
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["payload"] == {
+        "toolName": "shell",
+        "command": "cat <private-path>",
+    }
+
+
 def test_hermes_dependency_failures_are_clean_service_unavailable_responses(tmp_path):
     app = configured_app(tmp_path)
     app.state.control.sessions = AsyncMock(

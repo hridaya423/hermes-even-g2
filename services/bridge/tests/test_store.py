@@ -1,5 +1,6 @@
 
 import asyncio
+import json
 
 import pytest
 
@@ -178,6 +179,85 @@ async def test_prompt_admission_allows_one_immediate_turn_and_queues_the_other(s
     assert results == {"admitted", "queued"}
     queued = await store.list_queued_prompts("session")
     assert len(queued) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_inflight_prompts_repairs_queue_mirror_and_surfaces_attention(store):
+    admitted = await store.admit_prompt(
+        "session",
+        {"text": "active prompt", "deviceId": "device"},
+    )
+    queued = await store.admit_prompt(
+        "session",
+        {"text": "later prompt", "deviceId": "device"},
+        force_queue=True,
+    )
+
+    recovered = await store.recover_inflight_prompts()
+
+    assert [item["queueId"] for item in recovered] == [admitted["queueId"]]
+    async with store.connect() as database:
+        rows = await database.execute_fetchall(
+            "SELECT id,status FROM prompt_queue WHERE session_id=? ORDER BY created_at",
+            ("session",),
+        )
+        state = await (await database.execute(
+            "SELECT active_admission_id,queued_prompts_json FROM session_state WHERE session_id=?",
+            ("session",),
+        )).fetchone()
+        event = await (await database.execute(
+            "SELECT kind,payload_json FROM events WHERE session_id=? ORDER BY cursor DESC LIMIT 1",
+            ("session",),
+        )).fetchone()
+
+    assert [(row["id"], row["status"]) for row in rows] == [
+        (admitted["queueId"], "interrupted"),
+        (queued["queueId"], "queued"),
+    ]
+    assert state["active_admission_id"] is None
+    assert [item["text"] for item in json.loads(state["queued_prompts_json"])] == [
+        "later prompt"
+    ]
+    assert event["kind"] == "attention.created"
+    assert json.loads(event["payload_json"]) == {
+        "kind": "promptInterrupted",
+        "queueId": admitted["queueId"],
+        "reason": "bridge restarted before delivery",
+        "retryable": True,
+    }
+
+    # Recovery is idempotent: a second startup does not duplicate attention or
+    # retry the interrupted prompt.
+    assert await store.recover_inflight_prompts() == []
+
+
+@pytest.mark.asyncio
+async def test_recover_active_run_marks_run_interrupted_and_emits_stopped_state(store):
+    await store.update_run("run", "session", "device", "started", True)
+
+    recovered = await store.recover_inflight_prompts()
+
+    assert len(recovered) == 2
+    async with store.connect() as database:
+        run = await (await database.execute(
+            "SELECT status FROM run_correlation WHERE run_id=?", ("run",)
+        )).fetchone()
+        state = await (await database.execute(
+            "SELECT active_run_id FROM session_state WHERE session_id=?", ("session",)
+        )).fetchone()
+        events = await database.execute_fetchall(
+            "SELECT kind,payload_json FROM events WHERE session_id=? ORDER BY cursor",
+            ("session",),
+        )
+
+    assert run["status"] == "interrupted"
+    assert state["active_run_id"] is None
+    assert [event["kind"] for event in events] == ["attention.created", "run.cancelled"]
+    assert json.loads(events[-1]["payload_json"]) == {
+        "status": "interrupted",
+        "reason": "bridge restarted while the run was active",
+    }
+    assert await store.recover_inflight_prompts() == []
 
 
 @pytest.mark.asyncio

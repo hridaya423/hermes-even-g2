@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import math
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -27,30 +28,267 @@ def _bounded_text(value: Any, limit: int) -> str | None:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def sanitize_event_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Keep useful progress while ensuring secrets and raw tool inputs never persist."""
-    value = redact(payload)
+_KEY_ALIASES = {
+    "toolname": "toolName",
+    "currenttool": "currentTool",
+    "changedfiles": "changedFiles",
+    "changedfilecount": "changedFileCount",
+    "durationms": "durationMs",
+    "elapsedms": "elapsedMs",
+    "exitcode": "exitCode",
+    "finishreason": "finishReason",
+    "requestid": "requestId",
+    "runid": "runId",
+    "sessionid": "sessionId",
+    "queueid": "queueId",
+    "queueposition": "queuePosition",
+    "initiatedbyg2": "initiatedByG2",
+    "expiresat": "expiresAt",
+    "updatedat": "updatedAt",
+    "structuredsummary": "structuredSummary",
+    "suggestednextaction": "suggestedNextAction",
+    "prompttokens": "promptTokens",
+    "completiontokens": "completionTokens",
+    "totaltokens": "totalTokens",
+    "inputtokens": "inputTokens",
+    "outputtokens": "outputTokens",
+    "cachedtokens": "cachedTokens",
+}
+
+
+def _canonical_key(value: Any) -> str:
+    compact = str(value).strip().replace("-", "").replace("_", "").lower()
+    return _KEY_ALIASES.get(compact, str(value))
+
+
+def _safe_text(value: Any, limit: int) -> str | None:
+    # Stringifying arbitrary dicts/lists is both surprising to clients and an easy
+    # way to smuggle an unbounded nested provider payload into SQLite.
+    if not isinstance(value, (str, int, float, bool)):
+        return None
+    return _bounded_text(value, limit)
+
+
+def _safe_number(value: Any, *, minimum: int, maximum: int) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return max(minimum, min(maximum, value))
+
+
+def _project_choices(value: Any) -> list[Any] | None:
+    if not isinstance(value, list):
+        return None
+    choices: list[Any] = []
+    for item in value[:8]:
+        if isinstance(item, (str, int, float, bool)):
+            text = _safe_text(item, 160)
+            if text is not None:
+                choices.append(text)
+            continue
+        if not isinstance(item, dict):
+            continue
+        choice: dict[str, str] = {}
+        for raw_key, raw_value in item.items():
+            key = _canonical_key(raw_key)
+            if key not in {"id", "label", "description", "value"}:
+                continue
+            text = _safe_text(raw_value, 240 if key == "description" else 120)
+            if text is not None:
+                choice[key] = text
+        if choice:
+            choices.append(choice)
+    return choices
+
+
+def _project_string_list(value: Any, limit: int, item_limit: int) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    projected: list[str] = []
+    for item in value[:limit]:
+        text = _safe_text(item, item_limit)
+        if text is not None:
+            projected.append(text)
+    return projected
+
+
+def _project_usage(value: Any) -> dict[str, int] | None:
     if not isinstance(value, dict):
-        return {"value": _bounded_text(value, 2000)}
-    sanitized: dict[str, Any] = {}
-    secret_keys = {
-        "api_key", "apikey", "authorization", "credential", "environment", "env",
-        "headers", "input", "arguments", "args", "request", "raw", "secret",
-        "password", "token", "metadata",
+        return None
+    allowed = {
+        "promptTokens", "completionTokens", "totalTokens", "inputTokens",
+        "outputTokens", "cachedTokens", "tokens",
     }
-    long_text_keys = {"stdout", "stderr", "output", "details", "error", "reason"}
-    for key, item in value.items():
-        lowered = str(key).lower().replace("-", "_")
-        if lowered in secret_keys or any(term in lowered for term in ("password", "token", "secret", "credential")) or (lowered in {"stdout", "stderr", "output"} and kind != "message.completed"):
+    usage: dict[str, int] = {}
+    for raw_key, raw_value in value.items():
+        key = _canonical_key(raw_key)
+        if key not in allowed:
+            continue
+        number = _safe_number(raw_value, minimum=0, maximum=10_000_000)
+        if number is not None:
+            usage[key] = int(number)
+    return usage or None
+
+
+def _project_tests(value: Any) -> list[Any] | None:
+    if not isinstance(value, list):
+        return None
+    projected: list[Any] = []
+    allowed = {"name", "status", "durationMs", "summary", "error"}
+    for item in value[:8]:
+        if isinstance(item, (str, int, float, bool)):
+            text = _safe_text(item, 240)
+            if text is not None:
+                projected.append(text)
+            continue
+        if not isinstance(item, dict):
+            continue
+        test: dict[str, Any] = {}
+        for raw_key, raw_value in item.items():
+            key = _canonical_key(raw_key)
+            if key not in allowed:
+                continue
+            if key == "durationMs":
+                number = _safe_number(raw_value, minimum=0, maximum=86_400_000)
+                if number is not None:
+                    test[key] = int(number)
+            else:
+                text = _safe_text(raw_value, 500)
+                if text is not None:
+                    test[key] = text
+        if test:
+            projected.append(test)
+    return projected
+
+
+def _project_summary(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        "headline", "outcome", "keyChanges", "validation", "blocker",
+        "suggestedNextAction",
+    }
+    summary: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = _canonical_key(raw_key)
+        if key not in allowed:
+            continue
+        text = _safe_text(raw_value, 1200)
+        if text is not None:
+            summary[key] = text
+    return summary or None
+
+
+_COMMON_FIELDS = {
+    "phase", "status", "state", "message", "text", "summary", "reason",
+    "error", "details", "tool", "toolName", "currentTool", "command", "cwd",
+    "path", "destination", "rule", "model", "provider", "runId", "sessionId",
+    "requestId", "queueId", "queuePosition", "initiatedByG2", "retryable",
+    "durationMs", "elapsedMs", "exitCode", "changedFileCount", "changedFiles",
+    "tests", "usage", "choices", "expiresAt", "destructive", "sensitive",
+}
+_KIND_FIELDS = {
+    "message.completed": _COMMON_FIELDS | {
+        "role", "content", "finishReason", "structuredSummary", "headline",
+    },
+    "run.progress": _COMMON_FIELDS,
+    "run.started": _COMMON_FIELDS,
+    "run.completed": _COMMON_FIELDS,
+    "run.failed": _COMMON_FIELDS,
+    "run.cancelled": _COMMON_FIELDS,
+    "tool.started": _COMMON_FIELDS,
+    "tool.completed": _COMMON_FIELDS,
+    "tool.failed": _COMMON_FIELDS,
+    "approval.required": _COMMON_FIELDS,
+    "approval.resolved": _COMMON_FIELDS | {"choice"},
+    "attention.created": _COMMON_FIELDS | {"kind"},
+    "attention.resolved": _COMMON_FIELDS | {"kind", "choice"},
+    "session.updated": {
+        "id", "title", "state", "updatedAt", "source", "provider", "model",
+        "workspace", "project", "queuePosition", "latestAnswer",
+    },
+}
+_TEXT_FIELDS = {
+    "phase", "status", "state", "message", "text", "summary", "reason", "error",
+    "details", "tool", "toolName", "currentTool", "command", "cwd", "path",
+    "destination", "rule", "model", "provider", "runId", "sessionId", "requestId",
+    "queueId", "expiresAt", "role", "content", "finishReason", "choice", "kind",
+    "id", "title", "updatedAt", "source", "workspace", "project", "latestAnswer",
+    "headline", "outcome", "validation", "blocker", "suggestedNextAction",
+}
+_BOOL_FIELDS = {"initiatedByG2", "retryable", "destructive", "sensitive"}
+_NUMBER_FIELDS = {
+    "durationMs": (0, 86_400_000), "elapsedMs": (0, 86_400_000),
+    "exitCode": (-255, 255), "changedFileCount": (0, 100_000), "queuePosition": (0, 100_000),
+}
+_REDACT_FIELDS = {"stdout", "stderr", "output"}
+_SENSITIVE_FIELDS = {
+    "apikey", "authorization", "credential", "environment", "env", "headers",
+    "password", "secret", "token",
+}
+
+
+def sanitize_event_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Project provider events into a small, allowlisted and bounded safe shape.
+
+    Provider hooks routinely include raw request arguments, environment maps and
+    nested tool transcripts.  Redaction alone is not sufficient because unknown
+    future fields can still leak or create unbounded rows, so unknown keys and
+    nested objects are dropped unless they have an explicit bounded projection.
+    """
+    if not isinstance(payload, dict):
+        return {"value": _safe_text(payload, 2000)}
+    allowed = _KIND_FIELDS.get(kind, _COMMON_FIELDS)
+    sanitized: dict[str, Any] = {}
+    for raw_key, item in list(payload.items())[:64]:
+        key = _canonical_key(raw_key)
+        compact_key = str(raw_key).strip().replace("-", "").replace("_", "").lower()
+        if compact_key in _SENSITIVE_FIELDS or any(
+            marker in compact_key for marker in ("password", "secret", "credential", "token")
+        ):
+            # Retain a small, explicit redaction marker for top-level sensitive
+            # fields so clients can explain why context is unavailable.  We never
+            # recurse into the value, which prevents nested raw payload retention.
+            sanitized[str(raw_key)] = "<redacted>"
+            continue
+        if key in _REDACT_FIELDS:
+            # Preserve the fact that output existed without persisting arbitrary
+            # command output, which can contain secrets and huge transcripts.
             sanitized[key] = "<redacted>"
-        elif lowered in long_text_keys:
-            sanitized[key] = _bounded_text(item, 2000)
-        elif lowered in {"command", "cwd", "path", "destination", "rule", "tool", "tool_name"}:
-            sanitized[key] = _bounded_text(item, 1000)
-        elif lowered in {"content", "message", "text", "summary"}:
-            sanitized[key] = _bounded_text(item, 12000 if kind == "message.completed" else 2000)
-        else:
+        elif key not in allowed:
+            continue
+        elif key in _TEXT_FIELDS:
+            text = _safe_text(item, 12_000 if kind == "message.completed" and key in {"content", "message", "text"} else 2_000)
+            if text is not None:
+                sanitized[key] = text
+        elif key in _BOOL_FIELDS and isinstance(item, bool):
             sanitized[key] = item
+        elif key in _NUMBER_FIELDS:
+            minimum, maximum = _NUMBER_FIELDS[key]
+            number = _safe_number(item, minimum=minimum, maximum=maximum)
+            if number is not None:
+                sanitized[key] = int(number) if isinstance(number, float) and number.is_integer() else number
+        elif key == "choices":
+            projected = _project_choices(item)
+            if projected is not None:
+                sanitized[key] = projected
+        elif key == "changedFiles":
+            projected = _project_string_list(item, 50, 300)
+            if projected is not None:
+                sanitized[key] = projected
+        elif key == "tests":
+            projected = _project_tests(item)
+            if projected is not None:
+                sanitized[key] = projected
+        elif key == "usage":
+            projected = _project_usage(item)
+            if projected is not None:
+                sanitized[key] = projected
+        elif key == "structuredSummary":
+            projected = _project_summary(item)
+            if projected is not None:
+                sanitized[key] = projected
     return sanitized
 
 
@@ -200,7 +438,12 @@ class ControlService:
             if not title or len(title) > 120:
                 raise ValueError("session title must contain 1 to 120 characters")
             renamed = await self.hermes.rename_session(action.session_id, title)
-            await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload=renamed))
+            await self.store.append_event(EventInput(
+                kind="session.updated",
+                source="bridge",
+                sessionId=action.session_id,
+                payload=sanitize_event_payload("session.updated", renamed),
+            ))
             return renamed
         if kind == ActionKind.SET_SESSION_MODEL:
             if not self.capabilities.get("models"):

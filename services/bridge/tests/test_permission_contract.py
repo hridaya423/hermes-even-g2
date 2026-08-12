@@ -95,7 +95,7 @@ async def test_stale_and_wrong_session_or_run_approvals_are_rejected_before_herm
 
 @pytest.mark.parametrize("kind", list(APPROVAL_MAP))
 def test_approval_actions_require_exact_session_and_run(kind):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         AgentAction(
             kind=kind,
             deviceId="device",

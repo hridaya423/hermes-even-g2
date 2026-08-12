@@ -210,4 +210,65 @@ def test_sanitize_event_payload_removes_sensitive_run_details():
     assert "<private-path>" in value["command"]
     assert value["stdout"] == "<redacted>"
     assert value["environment"] == "<redacted>"
-    assert value["nested"]["password"] == "<redacted>"
+    assert "nested" not in value
+
+
+def test_sanitize_event_payload_projects_only_bounded_known_nested_values():
+    value = sanitize_event_payload(
+        "tool.completed",
+        {
+            "tool_name": "shell",
+            "command": "cat /Users/alice/private.txt",
+            "changed_files": [f"/Users/alice/file-{index}.txt" for index in range(100)],
+            "tests": [
+                {"name": "unit", "status": "passed", "duration_ms": 5, "secret": "drop"},
+                {"name": "integration", "status": "failed", "error": "bad"},
+            ],
+            "usage": {"total_tokens": 40, "prompt_tokens": 20, "raw": {"password": "drop"}},
+            "metadata": {"token": "drop"},
+            "nested": {"command": "drop"},
+            "output": "private command output",
+        },
+    )
+
+    assert value["toolName"] == "shell"
+    assert value["command"] == "cat <private-path>"
+    assert len(value["changedFiles"]) == 50
+    assert value["tests"] == [
+        {"name": "unit", "status": "passed", "durationMs": 5},
+        {"name": "integration", "status": "failed", "error": "bad"},
+    ]
+    assert value["usage"] == {"totalTokens": 40, "promptTokens": 20}
+    assert value["output"] == "<redacted>"
+    assert "metadata" not in value
+    assert "nested" not in value
+
+
+def test_sanitize_event_payload_bounds_message_and_approval_choices():
+    message = sanitize_event_payload(
+        "message.completed",
+        {
+            "content": "x" * 20_000,
+            "structured_summary": {
+                "headline": "Done",
+                "outcome": "Validated",
+                "unknown": {"secret": "drop"},
+            },
+            "raw": {"prompt": "drop"},
+        },
+    )
+    approval = sanitize_event_payload(
+        "approval.required",
+        {
+            "request_id": "request-1",
+            "choices": [f"choice-{index}" for index in range(20)],
+            "arguments": {"password": "drop"},
+        },
+    )
+
+    assert len(message["content"]) == 12_000
+    assert message["structuredSummary"] == {"headline": "Done", "outcome": "Validated"}
+    assert "raw" not in message
+    assert approval["requestId"] == "request-1"
+    assert len(approval["choices"]) == 8
+    assert "arguments" not in approval

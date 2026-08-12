@@ -25,8 +25,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .config import Settings
 from .hermes import HermesClient, HermesError
 from .models import AgentAction, EventInput, PairingExchange
-from .security import authenticate_websocket, redact, require_scope, verify_plugin
-from .service import ControlService
+from .security import authenticate_websocket, require_scope, verify_plugin
+from .service import ControlService, sanitize_event_payload
 from .store import Store
 from .stt import SpeechError, transcribe
 
@@ -73,7 +73,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         await store.migrate()
         await store.cleanup_attachments()
-        await store.recover_prompt_admissions()
+        recovered = await store.recover_inflight_prompts()
+        if recovered:
+            # Recovery only marks interrupted work and emits durable attention
+            # events.  Nothing is automatically re-run after a bridge restart.
+            logger.warning("Recovered %d interrupted Hermes prompt(s)", len(recovered))
         await service.probe()
         async def reconcile():
             while True:
@@ -404,7 +408,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         expected = config.plugin_secret.get_secret_value() if config.plugin_secret else None
         if not verify_plugin(expected, x_plugin_secret):
             raise HTTPException(401, "invalid plugin credential")
-        event.payload = redact(event.payload)
+        event.payload = sanitize_event_payload(event.kind, event.payload)
         return await store.append_event(event)
 
     return app
