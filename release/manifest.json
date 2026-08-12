@@ -1,0 +1,16 @@
+{
+  "artifacts": [
+    {
+      "bytes": 100086,
+      "name": "HermesG2.ehpk",
+      "sha256": "1943297efe3862c85d718289250c5f58b74ebeced5b19877c14e4cb7b7bea95b"
+    },
+    {
+      "bytes": 62355980,
+      "name": "hermes-g2-debug.apk",
+      "sha256": "3e496f5ce4cda3b9526c222ae7c2cf797d6eddaf16f5be5fbfae75e99d49e614"
+    }
+  ],
+  "project": "hermes-even-g2",
+  "schema": "private-glass-release/v1"
+}
