@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,18 +30,56 @@ import androidx.core.content.ContextCompat
 import com.honey.hermesg2.data.*
 import com.honey.hermesg2.service.HermesConnectionService
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
 import java.time.Instant
+import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.UUID
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private lateinit var tts: TextToSpeech
-    override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); tts = TextToSpeech(this, this); setContent { HermesTheme { Controller(intent.getStringExtra("sessionId")) } } }
-    override fun onInit(status: Int) { if (status == TextToSpeech.SUCCESS) tts.language = Locale.UK }
-    override fun onDestroy() { tts.shutdown(); super.onDestroy() }
+    private val deepLinkState = MutableStateFlow(DeepLinkTarget())
+    private val speakingState = MutableStateFlow(false)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        deepLinkState.value = DeepLinkTarget(intent.getStringExtra("sessionId"), intent.getStringExtra("runId"))
+        tts = TextToSpeech(this, this)
+        setContent {
+            HermesTheme {
+                val deepLink by deepLinkState.collectAsState()
+                Controller(deepLink)
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        deepLinkState.value = DeepLinkTarget(intent.getStringExtra("sessionId"), intent.getStringExtra("runId"))
+    }
+
+    override fun onInit(status: Int) {
+        if (status != TextToSpeech.SUCCESS) return
+        tts.language = Locale.UK
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) { speakingState.value = true }
+            override fun onDone(utteranceId: String?) { speakingState.value = false }
+            override fun onError(utteranceId: String?) { speakingState.value = false }
+        })
+    }
+
+    override fun onDestroy() {
+        speakingState.value = false
+        if (::tts.isInitialized) {
+            tts.stop()
+            tts.shutdown()
+        }
+        super.onDestroy()
+    }
 
     @OptIn(ExperimentalMaterial3Api::class)
-    @Composable private fun Controller(deepLinkSession: String?) {
+    @Composable private fun Controller(deepLink: DeepLinkTarget) {
         var credentials by remember { mutableStateOf(SecureCredentials(this).load()) }
         if (credentials == null) return Pairing { SecureCredentials(this).save(it); credentials = it; startConnection() }
         val client = remember(credentials) { BridgeClient(credentials!!) }
@@ -59,26 +98,40 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         var skillsInventory by remember { mutableStateOf<SkillsInventory?>(null) }
         var pendingAttachments by remember { mutableStateOf<List<AttachmentUpload>>(emptyList()) }
         var attachmentTargetSessionId by remember { mutableStateOf<String?>(null) }
+        var attachmentBusy by remember { mutableStateOf(false) }
+        var attachmentStatus by remember { mutableStateOf<String?>(null) }
+        var speechConfirmation by remember { mutableStateOf(false) }
+        val speaking by speakingState.collectAsState()
         val scope = rememberCoroutineScope()
         val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
         val attachmentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             val targetSessionId = attachmentTargetSessionId
-            if (targetSessionId != null && uris.isNotEmpty()) scope.launch {
+            if (targetSessionId == null || uris.isEmpty()) {
+                if (targetSessionId != null) attachmentStatus = "No files selected."
+            } else scope.launch {
+                val accepted = AttachmentSelectionPolicy.acceptedCount(pendingAttachments.size, uris.size)
+                if (accepted < uris.size) attachmentStatus = "Only $accepted of ${uris.size} selected files fit the ${AttachmentSelectionPolicy.MAX_ATTACHMENTS}-file limit."
+                attachmentBusy = true
                 runCatching {
-                    uris.take(10 - pendingAttachments.size).map { uri ->
+                    uris.take(accepted).map { uri ->
                         val local = readAttachment(uri)
                         client.uploadAttachment(targetSessionId, local.name, local.mediaType, local.bytes)
                     }
                 }.onSuccess { uploaded ->
-                    pendingAttachments = (pendingAttachments + uploaded).take(10)
+                    pendingAttachments = (pendingAttachments + uploaded).take(AttachmentSelectionPolicy.MAX_ATTACHMENTS)
+                    attachmentStatus = if (uploaded.isEmpty()) "No files uploaded." else "${uploaded.size} file${if (uploaded.size == 1) "" else "s"} attached (${uploaded.sumOf { it.size }.let(AttachmentSelectionPolicy::humanSize)})."
                     error = null
-                }.onFailure { error = it.message }
+                }.onFailure {
+                    attachmentStatus = "Attachment upload failed. Review the attached list before sending."
+                    error = it.message
+                }
+                attachmentBusy = false
             }
         }
         LaunchedEffect(persistedState.hasSnapshot, persistedState.selectedSessionId) {
             if (snapshot == null && persistedState.hasSnapshot) {
                 snapshot = persistedState.snapshot
-                selected = persistedState.snapshot.sessions.firstOrNull { session -> session.id == deepLinkSession }
+                selected = persistedState.snapshot.sessions.firstOrNull { session -> session.id == deepLink.sessionId }
                     ?: persistedState.snapshot.sessions.firstOrNull { session -> session.id == persistedState.selectedSessionId }
                     ?: persistedState.snapshot.sessions.firstOrNull()
             }
@@ -90,18 +143,52 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             runCatching { client.snapshot() }.onSuccess { fresh ->
                 stateRepository.persistSnapshot(fresh)
                 snapshot = fresh
-                selected = fresh.sessions.firstOrNull { session -> session.id == deepLinkSession }
+                selected = fresh.sessions.firstOrNull { session -> session.id == deepLink.sessionId }
                     ?: fresh.sessions.firstOrNull { session -> session.id == restored.selectedSessionId }
                     ?: fresh.sessions.firstOrNull()
             }.onFailure { error = it.message }
         }
-        LaunchedEffect(tab) { auxiliary = when (tab) { "Jobs" -> { jobs = if (snapshot?.hermes?.jobs == true) runCatching { client.jobs() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.jobs == true) "" else "Jobs are not advertised by this Hermes build." }; "Models" -> { modelOptions = if (snapshot?.hermes?.models == true) runCatching { client.modelOptions() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.models == true) "" else "Model options are unavailable." }; "Skills" -> { skillsInventory = if (snapshot?.hermes?.skills == true) runCatching { client.skills() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.skills == true) "" else "Skills are not advertised by this Hermes build." }; "Security" -> { devices = runCatching { client.devices() }.getOrElse { error = it.message; null }; runCatching { client.audit() }.getOrElse { it.message.orEmpty() } }; else -> "" } }
-        LaunchedEffect(selected?.id) { stateRepository.persistSelectedSession(selected?.id); pendingAttachments = emptyList(); history = selected?.let { session -> runCatching { client.messages(session.id) }.getOrElse { error = it.message; null } } }
+        LaunchedEffect(tab, snapshot?.hermes) { auxiliary = when (tab) { "Jobs" -> { jobs = if (snapshot?.hermes?.jobs == true) runCatching { client.jobs() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.jobs == true) "" else "Jobs are not advertised by this Hermes build." }; "Models" -> { modelOptions = if (snapshot?.hermes?.models == true) runCatching { client.modelOptions() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.models == true) "" else "Model options are unavailable." }; "Skills" -> { skillsInventory = if (snapshot?.hermes?.skills == true) runCatching { client.skills() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.skills == true) "" else "Skills are not advertised by this Hermes build." }; "Security" -> { devices = runCatching { client.devices() }.getOrElse { error = it.message; null }; runCatching { client.audit() }.getOrElse { it.message.orEmpty() } }; else -> "" } }
+        LaunchedEffect(deepLink.sessionId, snapshot?.sessions) {
+            deepLink.sessionId?.let { id -> snapshot?.sessions?.firstOrNull { it.id == id }?.let { selected = it } }
+        }
+        LaunchedEffect(selected?.id) { stateRepository.persistSelectedSession(selected?.id); pendingAttachments = emptyList(); attachmentStatus = null; history = selected?.let { session -> runCatching { client.messages(session.id) }.getOrElse { error = it.message; null } } }
+        val loadOlderHistory = {
+            val session = selected
+            val current = history
+            if (session != null && current != null && current.hasMore) scope.launch {
+                runCatching { client.messages(session.id, limit = current.limit, offset = current.offset + current.data.size) }
+                    .onSuccess { older ->
+                        val merged = (current.data + older.data).distinctBy { it.id }
+                        history = current.copy(data = merged, total = older.total, hasMore = older.hasMore)
+                        error = null
+                    }
+                    .onFailure { error = it.message }
+            }
+        }
+        if (speechConfirmation) AlertDialog(
+            onDismissRequest = { speechConfirmation = false },
+            title = { Text(if (speaking) "Stop phone playback?" else "Speak latest answer?") },
+            text = { Text(if (speaking) "Stop Hermes playback now?" else "This reads the newest assistant answer aloud through the phone speaker. Use headphones or a private place if the session may contain sensitive information.") },
+            confirmButton = {
+                Button(onClick = {
+                    if (speaking) {
+                        tts.stop()
+                        speakingState.value = false
+                    } else {
+                        val text = SpeechSelectionPolicy.latestAssistant(history?.data.orEmpty())?.content
+                        if (!text.isNullOrBlank() && tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hermes-answer") == TextToSpeech.ERROR) speakingState.value = false
+                    }
+                    speechConfirmation = false
+                }) { Text(if (speaking) "Stop" else "Speak") }
+            },
+            dismissButton = { TextButton(onClick = { speechConfirmation = false }) { Text("Cancel") } },
+        )
         Scaffold(topBar = { TopAppBar(title = { Text("Hermes G2") }, actions = { TextButton(onClick = { scope.launch { client.action(AgentAction("createSession", credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("title" to "G2 session"))); snapshot = client.snapshot() } }) { Text("New session") }; IconButton(onClick = { scope.launch { snapshot = client.snapshot() } }) { Icon(Icons.Default.Refresh, "Refresh") } }) }, bottomBar = { NavigationBar { listOf("Sessions" to Icons.AutoMirrored.Filled.Chat, "Jobs" to Icons.Default.Schedule, "Models" to Icons.Default.Tune, "Skills" to Icons.Default.Build, "Security" to Icons.Default.Security).forEach { (name, icon) -> NavigationBarItem(tab == name, { tab = name }, { Icon(icon, name) }, label = { Text(name) }) } } }) { padding ->
             if (tab == "Jobs") JobsPane(jobs, auxiliary, onAction = { kind, jobId -> scope.launch { runCatching { client.action(AgentAction(kind, credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("jobId" to jobId))) }.onSuccess { jobs = client.jobs() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab == "Models") ModelPane(modelOptions, selected, onSelect = { provider, model -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("setSessionModel", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("provider" to provider, "model" to model))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, Modifier.padding(padding)) else if (tab == "Skills") SkillsPane(skillsInventory, auxiliary, Modifier.padding(padding)) else if (tab == "Security") SecurityPane(devices, credentials!!.deviceId, auxiliary, onRevoke = { deviceId -> scope.launch { runCatching { client.revokeDevice(deviceId) }.onSuccess { devices = client.devices() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab != "Sessions") AuxiliaryPane(tab, auxiliary, Modifier.padding(padding)) else Row(Modifier.padding(padding).fillMaxSize()) {
-                LazyColumn(Modifier.width(320.dp).fillMaxHeight()) { item { Readiness(snapshot?.runtime, error) }; snapshot?.pendingApprovals?.firstOrNull()?.let { approval -> item { ApprovalPane(approval, snapshot!!.hermes.sessionApprovalResponse) { choice -> scope.launch { runCatching { client.action(AgentAction(mapOf("once" to "approveOnce", "session" to "approveSession", "always" to "approveAlways", "deny" to "deny").getValue(choice), credentials!!.deviceId, UUID.randomUUID().toString(), approval.sessionId, approval.runId, "awaiting_approval", Instant.now().toString(), mapOf("requestId" to approval.requestId))) }.onSuccess { snapshot = client.snapshot() }.onFailure { error = it.message } } } } }; items(snapshot?.sessions.orEmpty(), key = { it.id }) { session -> ListItem(headlineContent = { Text(session.title) }, supportingContent = { Text("${session.source} · ${session.state}") }, leadingContent = { Icon(if (session.pinned) Icons.Default.PushPin else Icons.Default.ChatBubbleOutline, null) }, modifier = Modifier.fillMaxWidth(), trailingContent = { IconButton(onClick = { selected = session }) { Icon(Icons.Default.ChevronRight, "Open") } }); HorizontalDivider() } }
+                LazyColumn(Modifier.width(320.dp).fillMaxHeight()) { item { Readiness(snapshot?.runtime, error) }; snapshot?.pendingApprovals?.firstOrNull { approval -> deepLink.runId == null || approval.runId == deepLink.runId }?.let { approval -> item { ApprovalPane(approval, snapshot!!.hermes.sessionApprovalResponse) { choice -> ApprovalPolicy.actionKindFor(choice)?.let { kind -> scope.launch { runCatching { client.action(AgentAction(kind, credentials!!.deviceId, UUID.randomUUID().toString(), approval.sessionId, approval.runId, "awaiting_approval", Instant.now().toString(), mapOf("requestId" to approval.requestId))) }.onSuccess { snapshot = client.snapshot() }.onFailure { error = it.message } } } } } }; items(snapshot?.sessions.orEmpty(), key = { it.id }) { session -> ListItem(headlineContent = { Text(session.title) }, supportingContent = { Text("${session.source} · ${session.state}") }, leadingContent = { Icon(if (session.pinned) Icons.Default.PushPin else Icons.Default.ChatBubbleOutline, null) }, modifier = Modifier.fillMaxWidth(), trailingContent = { IconButton(onClick = { selected = session }) { Icon(Icons.Default.ChevronRight, "Open") } }); HorizontalDivider() } }
                 VerticalDivider()
-                SessionPane(selected, history, prompt, { prompt = it }, pendingAttachments, onAttach = { session -> attachmentTargetSessionId = session.id; attachmentPicker.launch(arrayOf("*/*")) }, onRemoveAttachment = { attachmentId -> pendingAttachments = pendingAttachments.filterNot { it.attachmentId == attachmentId } }, onSend = { text -> selected?.let { session -> scope.launch { runCatching { client.action(AttachmentPromptPolicy.promptAction(credentials!!.deviceId, session.id, session.state == "busy", text, pendingAttachments, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { prompt = ""; pendingAttachments = emptyList() }.onFailure { error = it.message } } } }, onFork = { selected?.let { session -> scope.launch { client.action(AgentAction("forkSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onRename = { title -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("renameSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("title" to title))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, onPin = { selected?.let { session -> scope.launch { client.action(AgentAction(if (session.pinned) "unpinSession" else "pinSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onSpeak = { history?.data?.firstOrNull { it.role == "assistant" }?.content?.let { text -> tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hermes-answer") } }, activeRun = selected?.let { RunControlPolicy.activeRunFor(it.id, snapshot?.activeRuns.orEmpty()) }, runControlEnabled = snapshot?.hermes?.sessionRunControl == true, onStop = { run -> scope.launch { runCatching { client.action(RunControlPolicy.stopAction(credentials!!.deviceId, run, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { snapshot = client.snapshot(); error = null }.onFailure { error = it.message } } }, modifier = Modifier.weight(1f))
+                SessionPane(selected, history, prompt, { prompt = it }, pendingAttachments, attachmentBusy, attachmentStatus, onAttach = { session -> attachmentTargetSessionId = session.id; attachmentStatus = null; attachmentPicker.launch(arrayOf("*/*")) }, onRemoveAttachment = { attachmentId -> pendingAttachments = pendingAttachments.filterNot { it.attachmentId == attachmentId } }, onLoadOlder = loadOlderHistory, onSend = { text -> selected?.let { session -> scope.launch { runCatching { client.action(AttachmentPromptPolicy.promptAction(credentials!!.deviceId, session.id, session.state == "busy", text, pendingAttachments, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { prompt = ""; pendingAttachments = emptyList(); attachmentStatus = null }.onFailure { error = it.message } } } }, onFork = { selected?.let { session -> scope.launch { client.action(AgentAction("forkSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onRename = { title -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("renameSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("title" to title))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, onPin = { selected?.let { session -> scope.launch { client.action(AgentAction(if (session.pinned) "unpinSession" else "pinSession", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString())); snapshot = client.snapshot() } } }, onSpeak = { speechConfirmation = true }, speaking = speaking, activeRun = selected?.let { RunControlPolicy.activeRunFor(it.id, snapshot?.activeRuns.orEmpty()) }, runControlEnabled = snapshot?.hermes?.sessionRunControl == true, onStop = { run -> scope.launch { runCatching { client.action(RunControlPolicy.stopAction(credentials!!.deviceId, run, UUID.randomUUID().toString(), Instant.now().toString())) }.onSuccess { snapshot = client.snapshot(); error = null }.onFailure { error = it.message } } }, modifier = Modifier.weight(1f))
             }
         }
     }
@@ -110,30 +197,71 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private data class LocalAttachment(val name: String, val mediaType: String, val bytes: ByteArray)
     private fun readAttachment(uri: Uri): LocalAttachment {
         var name = "attachment"
+        var declaredSize: Long? = null
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) name = cursor.getString(0) ?: name
         }
-        val bytes = contentResolver.openInputStream(uri)?.use { it.readNBytes(25 * 1024 * 1024 + 1) }
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst() && !cursor.isNull(0)) declaredSize = cursor.getLong(0)
+        }
+        require(declaredSize == null || declaredSize <= AttachmentSelectionPolicy.MAX_BYTES) {
+            "${name} is larger than the ${AttachmentSelectionPolicy.humanSize(AttachmentSelectionPolicy.MAX_BYTES)} limit"
+        }
+        val bytes = contentResolver.openInputStream(uri)?.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8 * 1024)
+            var total = 0
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                require(total <= AttachmentSelectionPolicy.MAX_BYTES) { "${name} exceeds the ${AttachmentSelectionPolicy.humanSize(AttachmentSelectionPolicy.MAX_BYTES)} limit" }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        }
             ?: error("Unable to open attachment")
         require(bytes.isNotEmpty()) { "Attachment is empty" }
-        require(bytes.size <= 25 * 1024 * 1024) { "Attachment exceeds 25 MB" }
+        require(bytes.size <= AttachmentSelectionPolicy.MAX_BYTES) { "${name} exceeds the ${AttachmentSelectionPolicy.humanSize(AttachmentSelectionPolicy.MAX_BYTES)} limit" }
         return LocalAttachment(name, contentResolver.getType(uri) ?: "application/octet-stream", bytes)
     }
     @Composable private fun Pairing(onPaired: (DeviceCredentials) -> Unit) { var origin by remember { mutableStateOf(BuildConfig.DEFAULT_BRIDGE_ORIGIN) }; var code by remember { mutableStateOf("") }; var error by remember { mutableStateOf<String?>(null) }; var busy by remember { mutableStateOf(false) }; val scope = rememberCoroutineScope(); Column(Modifier.fillMaxSize().padding(32.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) { Text("Pair private bridge", style = MaterialTheme.typography.headlineLarge); Text("Enter the 90-second, single-use code shown by `hermes-g2-bridge pair android`. A revocable Android credential is generated and encrypted in Keystore; the Hermes master key never leaves the Mac mini."); OutlinedTextField(origin, { origin = it.trimEnd('/') }, label = { Text("Tailscale HTTPS origin") }, modifier = Modifier.fillMaxWidth()); OutlinedTextField(code, { code = it.filter(Char::isDigit).take(6) }, label = { Text("Pairing code") }, modifier = Modifier.fillMaxWidth()); error?.let { Text(it, color = MaterialTheme.colorScheme.error) }; Button(enabled = !busy && origin.startsWith("https://") && code.length == 6, onClick = { busy = true; scope.launch { runCatching { BridgeClient.exchange(origin, code, Build.MODEL) }.onSuccess(onPaired).onFailure { error = it.message; busy = false } } }) { Text(if (busy) "Pairing…" else "Pair device") } } }
-    @Composable private fun Readiness(value: RuntimeReadiness?, error: String?) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { Text(if (value?.coreReady == true) "Core ready" else "Core unavailable", fontWeight = FontWeight.Bold, color = if (value?.coreReady == true) Color(0xFF3A7D44) else MaterialTheme.colorScheme.error); Text(if (value?.guiReady == true) "GUI tools ready" else "GUI tools unavailable while logged out"); error?.let { Text(it, color = MaterialTheme.colorScheme.error) } } }
+    @Composable private fun Readiness(value: RuntimeReadiness?, error: String?) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(ReadinessPolicy.headline(value, error), fontWeight = FontWeight.Bold, color = if (value?.coreReady == true) Color(0xFF3A7D44) else MaterialTheme.colorScheme.error)
+            if (value == null && error == null) Text("Waiting for the private bridge…", style = MaterialTheme.typography.bodySmall)
+            ReadinessPolicy.lines(value, error).filterNot { value == null && it.label != "Last error" }.forEach { line ->
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Icon(
+                        if (line.ready) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                        contentDescription = if (line.ready) "Ready" else "Unavailable",
+                        tint = if (line.ready) Color(0xFF3A7D44) else MaterialTheme.colorScheme.error,
+                    )
+                    Column {
+                        Text(line.label, fontWeight = FontWeight.SemiBold)
+                        Text(line.detail, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        }
+    }
     @Composable private fun SessionPane(
         session: SessionSummary?,
         history: MessagePage?,
         prompt: String,
         onPrompt: (String) -> Unit,
         attachments: List<AttachmentUpload>,
+        attachmentBusy: Boolean,
+        attachmentStatus: String?,
         onAttach: (SessionSummary) -> Unit,
         onRemoveAttachment: (String) -> Unit,
+        onLoadOlder: () -> Unit,
         onSend: (String) -> Unit,
         onFork: () -> Unit,
         onRename: (String) -> Unit,
         onPin: () -> Unit,
         onSpeak: () -> Unit,
+        speaking: Boolean,
         activeRun: ActiveRun?,
         runControlEnabled: Boolean,
         onStop: (ActiveRun) -> Unit,
@@ -165,10 +293,13 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     TextButton(onClick = onPin) { Text(if (it.pinned) "Unpin from G2" else "Pin to G2") }
                     TextButton(onClick = onFork) { Text("Fork") }
                     TextButton(onClick = { title = it.title; renaming = true }) { Text("Rename") }
-                    TextButton(onClick = onSpeak, enabled = history?.data?.any { message -> message.role == "assistant" } == true) { Text("Speak") }
+                    TextButton(onClick = onSpeak, enabled = history?.data?.any { message -> message.role == "assistant" && message.content.isNotBlank() } == true) { Text(if (speaking) "Stop speech" else "Speak") }
                     if (activeRun != null) TextButton(onClick = { confirmingStop = true }, enabled = runControlEnabled) { Text("Stop run") }
                 }
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (history?.hasMore == true) item {
+                        TextButton(onClick = onLoadOlder) { Text("Load older messages") }
+                    }
                     items(history?.data.orEmpty().asReversed(), key = { message -> message.id }) { message ->
                         Column {
                             Text(message.role.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
@@ -185,10 +316,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         )
                     }
                 }
+                attachmentStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = if (attachmentBusy) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant) }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(prompt, onPrompt, label = { Text("Continue this exact session") }, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { onAttach(it) }, enabled = attachments.size < 10) { Icon(Icons.Default.AttachFile, "Attach files") }
-                    IconButton(onClick = { onSend(prompt) }, enabled = prompt.isNotBlank() || attachments.isNotEmpty()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+                    IconButton(onClick = { onAttach(it) }, enabled = !attachmentBusy && attachments.size < AttachmentSelectionPolicy.MAX_ATTACHMENTS) { Icon(Icons.Default.AttachFile, "Attach files") }
+                    IconButton(onClick = { onSend(prompt) }, enabled = !attachmentBusy && (prompt.isNotBlank() || attachments.isNotEmpty())) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
                 }
             }
         }
@@ -200,7 +332,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         pendingChoice?.let { choice ->
             AlertDialog(
                 onDismissRequest = { pendingChoice = null; confirmationStep = 0 },
-                title = { Text(if (confirmationStep == 0) "Confirm ${choice.uppercase()}" else "Confirm persistent or sensitive access") },
+                title = { Text(if (confirmationStep == 0) "Confirm ${ApprovalPolicy.displayLabel(choice)}" else "Confirm persistent or sensitive access") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("Tool: ${value.tool}")
@@ -213,7 +345,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     Button(onClick = {
                         if (requiresSecondConfirmation && confirmationStep == 0) confirmationStep = 1
                         else { pendingChoice = null; confirmationStep = 0; onChoice(choice) }
-                    }) { Text(if (requiresSecondConfirmation && confirmationStep == 0) "Review again" else "Submit ${choice.uppercase()}") }
+                }) { Text(if (requiresSecondConfirmation && confirmationStep == 0) "Review again" else "Submit ${ApprovalPolicy.displayLabel(choice)}") }
                 },
                 dismissButton = { TextButton(onClick = { pendingChoice = null; confirmationStep = 0 }) { Text("Cancel") } },
             )
@@ -224,7 +356,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 Text(value.tool)
                 Text(value.command ?: value.destination ?: "Review this request privately.")
                 if (!enabled) Text("This Hermes build cannot accept native session approvals.", color = MaterialTheme.colorScheme.error)
-                else Row { value.choices.forEach { choice -> Button(onClick = { pendingChoice = choice; confirmationStep = 0 }, modifier = Modifier.padding(end = 6.dp)) { Text(choice.uppercase()) } } }
+                else Row { value.choices.forEach { choice ->
+                    val supported = ApprovalPolicy.actionKindFor(choice) != null
+                    Button(
+                        onClick = { pendingChoice = choice; confirmationStep = 0 },
+                        enabled = supported,
+                        modifier = Modifier.padding(end = 6.dp),
+                    ) { Text(ApprovalPolicy.displayLabel(choice)) }
+                } }
             }
         }
     }

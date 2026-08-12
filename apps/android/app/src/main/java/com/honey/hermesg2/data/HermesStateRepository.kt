@@ -58,14 +58,7 @@ class HermesStateRepository private constructor(context: Context) {
         .first()
 
     suspend fun persistSnapshot(snapshot: Snapshot): HermesPersistedState = update { current ->
-        current.copy(
-            hasSnapshot = true,
-            snapshot = snapshot,
-            lastAckedCursor = maxOf(current.lastAckedCursor, snapshot.cursor),
-            // A snapshot contains the authoritative pending approval set. Any
-            // event-only attention records must be replayed after this cursor.
-            pendingEvents = emptyList(),
-        )
+        HermesStateReducer.applySnapshot(current, snapshot)
     }
 
     suspend fun persistEvent(event: DurableEvent): HermesPersistedState = update { current ->
@@ -146,6 +139,25 @@ internal object HermesStateReducer {
             events = events,
             pendingEvents = pending,
             lastAckedCursor = maxOf(state.lastAckedCursor, event.cursor),
+        )
+    }
+
+    /**
+     * A snapshot is authoritative for approvals and sessions, but it does not
+     * contain every attention item (for example a failure notification). Keep
+     * those durable attention events across a resnapshot so process death or a
+     * replay gap cannot silently erase an item the user has not opened yet.
+     */
+    fun applySnapshot(state: HermesPersistedState, snapshot: Snapshot): HermesPersistedState {
+        val approvalIds = snapshot.pendingApprovals.map { it.requestId }.toSet()
+        val pending = state.pendingEvents.filter { event ->
+            event.kind != "approval.required" || event.payload?.requestId()?.let(approvalIds::contains) == true
+        }
+        return state.copy(
+            hasSnapshot = true,
+            snapshot = snapshot,
+            lastAckedCursor = maxOf(state.lastAckedCursor, snapshot.cursor),
+            pendingEvents = pending,
         )
     }
 

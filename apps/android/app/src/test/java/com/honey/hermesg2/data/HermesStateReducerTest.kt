@@ -44,6 +44,27 @@ class HermesStateReducerTest {
         assertEquals(400L, state.events.last().cursor)
     }
 
+    @Test fun `resnapshot preserves unresolved attention while pruning resolved approvals`() {
+        val attention = event("attention", 1, "attention.created")
+        val approval = event("approval", 2, "approval.required", "request-a")
+        val state = HermesStateReducer.apply(
+            HermesStateReducer.apply(HermesPersistedState(), attention),
+            approval,
+        )
+        val snapshot = Snapshot(
+            cursor = 2,
+            pendingApprovals = listOf(
+                ApprovalRequest("request-a", "session-1", "run-1", "shell"),
+            ),
+        )
+        val preserved = HermesStateReducer.applySnapshot(state, snapshot)
+        assertEquals(listOf("attention", "approval"), preserved.pendingEvents.map { it.eventId })
+
+        val resolvedSnapshot = snapshot.copy(pendingApprovals = emptyList())
+        val pruned = HermesStateReducer.applySnapshot(state, resolvedSnapshot)
+        assertEquals(listOf("attention"), pruned.pendingEvents.map { it.eventId })
+    }
+
     private fun event(id: String, cursor: Long, kind: String, requestId: String? = null): DurableEvent = DurableEvent(
         eventId = id,
         cursor = cursor,

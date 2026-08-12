@@ -5,6 +5,19 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class AttachmentPromptPolicyTest {
+    @Test fun `attachment picker never admits more than the remaining slots`() {
+        assertEquals(10, AttachmentSelectionPolicy.availableSlots(0))
+        assertEquals(3, AttachmentSelectionPolicy.availableSlots(7))
+        assertEquals(0, AttachmentSelectionPolicy.availableSlots(10))
+        assertEquals(3, AttachmentSelectionPolicy.acceptedCount(7, 9))
+    }
+
+    @Test fun `human size stays compact for picker status`() {
+        assertEquals("512 B", AttachmentSelectionPolicy.humanSize(512))
+        assertEquals("2 KB", AttachmentSelectionPolicy.humanSize(2048))
+        assertEquals("1.5 MB", AttachmentSelectionPolicy.humanSize(1572864))
+    }
+
     @Test fun `prompt action binds uploaded IDs to the visible session`() {
         val attachments = listOf(
             AttachmentUpload("attachment-1", "session-1", "a.png", "image/png", 10, "a"),
