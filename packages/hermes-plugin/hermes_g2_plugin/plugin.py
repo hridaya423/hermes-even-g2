@@ -1,10 +1,97 @@
 import os
-import queue
 import threading
+from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
 
 import httpx
+
+
+@dataclass(frozen=True)
+class _QueuedEvent:
+    priority: int
+    sequence: int
+    envelope: dict[str, Any]
+
+
+class _EventBuffer:
+    """A bounded, non-blocking buffer that protects terminal events first.
+
+    Hook callbacks run inside Hermes' execution path, so enqueueing may take a
+    short mutex but can never wait for the network worker or an available slot.
+    Lower-priority progress is discarded before approvals, failures, and
+    lifecycle terminal events. A closed buffer drains what it already has and
+    then tells the worker to exit.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = max(1, maxsize)
+        self._condition = threading.Condition()
+        self._events: list[_QueuedEvent] = []
+        self._sequence = 0
+        self._dropped = 0
+        self._closed = False
+
+    @property
+    def pending_count(self) -> int:
+        with self._condition:
+            return len(self._events)
+
+    @property
+    def dropped_count(self) -> int:
+        with self._condition:
+            return self._dropped
+
+    def put_nowait(self, envelope: dict[str, Any], *, priority: int) -> bool:
+        """Enqueue without waiting for capacity or the delivery worker."""
+
+        with self._condition:
+            if self._closed:
+                self._dropped += 1
+                return False
+
+            item = _QueuedEvent(priority, self._sequence, envelope)
+            self._sequence += 1
+            if len(self._events) >= self._maxsize:
+                victim_index = min(
+                    range(len(self._events)),
+                    key=lambda index: (
+                        self._events[index].priority,
+                        self._events[index].sequence,
+                    ),
+                )
+                victim = self._events[victim_index]
+                # Keep already-buffered work when it has equal importance. A
+                # newer critical event can still displace older progress.
+                if priority <= victim.priority:
+                    self._dropped += 1
+                    return False
+                self._events.pop(victim_index)
+                self._dropped += 1
+
+            self._events.append(item)
+            self._condition.notify()
+            return True
+
+    def get(self) -> dict[str, Any] | None:
+        with self._condition:
+            while not self._events and not self._closed:
+                self._condition.wait()
+            if not self._events:
+                return None
+            next_index = max(
+                range(len(self._events)),
+                key=lambda index: (
+                    self._events[index].priority,
+                    -self._events[index].sequence,
+                ),
+            )
+            return self._events.pop(next_index).envelope
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
 
 
 class HermesG2Observer:
@@ -19,10 +106,7 @@ class HermesG2Observer:
         self.origin = os.environ.get("HERMES_G2_PLUGIN_ORIGIN", "http://127.0.0.1:8765")
         self.secret = os.environ.get("HERMES_G2_PLUGIN_SECRET", "")
         self._sender = sender
-        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
-            maxsize=max(1, queue_size)
-        )
-        self._dropped = 0
+        self._queue = _EventBuffer(queue_size)
         self._thread: threading.Thread | None = None
         if self.secret:
             self._thread = threading.Thread(
@@ -34,27 +118,16 @@ class HermesG2Observer:
 
     @property
     def pending_count(self) -> int:
-        return self._queue.qsize()
+        return self._queue.pending_count
 
     @property
     def dropped_count(self) -> int:
-        return self._dropped
+        return self._queue.dropped_count
 
     def close(self) -> None:
         if not self._thread:
             return
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except queue.Empty:
-                pass
-            try:
-                self._queue.put_nowait(None)
-            except queue.Full:
-                return
+        self._queue.close()
         self._thread.join(timeout=1)
 
     def _deliver(self) -> None:
@@ -62,9 +135,9 @@ class HermesG2Observer:
         try:
             while True:
                 envelope = self._queue.get()
+                if envelope is None:
+                    return
                 try:
-                    if envelope is None:
-                        return
                     if self._sender:
                         self._sender(envelope)
                     elif client:
@@ -75,8 +148,6 @@ class HermesG2Observer:
                         )
                 except Exception:  # noqa: BLE001, S110 -- observation stays fail-open
                     pass
-                finally:
-                    self._queue.task_done()
         finally:
             if client:
                 client.close()
@@ -105,16 +176,10 @@ class HermesG2Observer:
             "runId": run_id,
             "payload": safe,
         }
-        try:
-            self._queue.put_nowait(envelope)
-        except queue.Full:
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-                self._dropped += 1
-                self._queue.put_nowait(envelope)
-            except (queue.Empty, queue.Full):
-                self._dropped += 1
+        self._queue.put_nowait(
+            envelope,
+            priority=self._event_priority(kind, event_kind=envelope["kind"], kwargs=kwargs),
+        )
 
     @staticmethod
     def _run_id(kwargs: dict[str, Any]) -> str | None:
@@ -130,7 +195,48 @@ class HermesG2Observer:
             "subagent_start": "subagent.started",
             "subagent_stop": "subagent.completed", "pre_approval_request": "attention.created",
             "post_approval_response": "attention.resolved",
-        }[hook]
+        }.get(hook, "unknown")
+
+    @staticmethod
+    def _event_priority(
+        hook: str,
+        *,
+        event_kind: str,
+        kwargs: dict[str, Any],
+    ) -> int:
+        """Rank events for bounded delivery; higher values are retained first."""
+
+        status = str(kwargs.get("status") or "").strip().lower()
+        if (
+            kwargs.get("error")
+            or kwargs.get("exception")
+            or status
+            in {
+                "failed",
+                "failure",
+                "error",
+                "errored",
+                "exception",
+                "crashed",
+                "cancelled",
+                "canceled",
+                "interrupted",
+                "aborted",
+                "timeout",
+            }
+        ):
+            return 100
+        if event_kind == "attention.created" or hook == "pre_approval_request":
+            return 100
+        if event_kind == "attention.resolved" or hook == "post_approval_response":
+            return 90
+        if hook in {"on_session_end", "on_session_finalize", "on_session_reset"}:
+            return 80
+        if hook == "subagent_stop" or status in {"completed", "complete", "done"}:
+            return 60
+        if event_kind == "unknown":
+            return 20
+        return 10
 
     def on_session_start(self, **kwargs): self._send("on_session_start", kwargs)
     def on_session_end(self, **kwargs): self._send("on_session_end", kwargs)
