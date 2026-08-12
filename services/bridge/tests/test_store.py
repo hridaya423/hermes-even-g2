@@ -198,6 +198,8 @@ async def test_queued_prompt_claim_is_durable_and_revoked_device_is_skipped(stor
     reopened = Store(store.path)
     pending = await reopened.list_queued_prompts("session")
     assert pending == []
+    await reopened.complete_prompt(claimed["queueId"], "session")
+    assert (await reopened.session_overlays(["session"]))["session"]["state"] == "idle"
 
 
 @pytest.mark.asyncio

@@ -776,10 +776,14 @@ class Store:
                     await db.rollback()
                     return None
                 if not await self._device_active_in_db(db, row["device_id"]):
+                    payload = json.loads(row["payload_json"])
                     await db.execute("DELETE FROM prompt_queue WHERE id=?", (row["id"],))
                     state = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
                     queue = json.loads(state["queued_prompts_json"]) if state else []
-                    if queue:
+                    if payload in queue:
+                        queue.remove(payload)
+                        await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
+                    elif queue:
                         queue.pop(0)
                         await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
                     continue
@@ -801,10 +805,20 @@ class Store:
     async def complete_prompt(self, queue_id: str, session_id: str) -> None:
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("SELECT payload_json,claim_token FROM prompt_queue WHERE id=?", (queue_id,))).fetchone()
             await db.execute("DELETE FROM prompt_queue WHERE id=?", (queue_id,))
+            if row and row["claim_token"]:
+                await db.execute(
+                    "UPDATE session_state SET active_admission_id=NULL,active_admission_at=NULL,updated_at=? WHERE session_id=? AND active_admission_id=?",
+                    (utc_now().isoformat(), session_id, row["claim_token"]),
+                )
             state = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
             queue = json.loads(state["queued_prompts_json"]) if state else []
-            if queue:
+            payload = json.loads(row["payload_json"]) if row else None
+            if payload in queue:
+                queue.remove(payload)
+                await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
+            elif queue and row:
                 queue.pop(0)
                 await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
             await db.commit()
