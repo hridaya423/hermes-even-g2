@@ -1,7 +1,7 @@
 import os
 import threading
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
