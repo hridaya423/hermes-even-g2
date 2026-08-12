@@ -1,4 +1,6 @@
 
+import asyncio
+
 import pytest
 
 from hermes_g2_bridge.models import EventInput
@@ -81,6 +83,18 @@ async def test_attachment_cleanup_deletes_expired_rows_and_files(store, tmp_path
     assert row["count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_attachment_cleanup_removes_orphaned_files(tmp_path):
+    root = tmp_path / "attachments"
+    root.mkdir()
+    orphan = root / "orphan.bin"
+    orphan.write_bytes(b"orphan")
+    store = Store(tmp_path / "bridge.db", root)
+    await store.migrate()
+    assert await store.cleanup_attachments() == 1
+    assert not orphan.exists()
+
+
 async def test_migrations_are_idempotent(store):
     await store.migrate()
     async with store.connect() as database:
@@ -104,7 +118,7 @@ async def test_migration_recovers_when_column_committed_before_marker(tmp_path):
             "SELECT version FROM schema_migrations ORDER BY version"
         )
         columns = await database.execute_fetchall("PRAGMA table_info(session_state)")
-    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert [row["version"] for row in versions] == list(range(1, len(versions) + 1))
     assert "source_override" in {row["name"] for row in columns}
 
 
@@ -113,6 +127,22 @@ async def test_events_replay_in_cursor_order(store):
     second = await store.append_event(EventInput(kind="run.completed", source="hermes", sessionId="s", runId="r", payload={}))
     replay = await store.events_after(first["cursor"] - 1)
     assert [item["eventId"] for item in replay] == [first["eventId"], second["eventId"]]
+
+
+@pytest.mark.asyncio
+async def test_event_stream_terminates_when_device_is_revoked(store):
+    code = await store.create_pairing("hub", 90)
+    device_id, _, _ = await store.exchange_pairing(code, "device", "hub")
+    stream = store.event_stream(0, device_id=device_id)
+    pending = asyncio.create_task(stream.__anext__())
+    await asyncio.sleep(0)
+    await store.revoke_device(device_id)
+    assert await asyncio.wait_for(pending, timeout=1) == {
+        "type": "auth.revoked",
+        "deviceId": device_id,
+    }
+    with pytest.raises(StopAsyncIteration):
+        await stream.__anext__()
 
 
 async def test_idempotency_rejects_body_mismatch(store):
@@ -132,6 +162,54 @@ async def test_prompt_queue_survives_store_reopen(store):
     assert await reopened.dequeue_prompt("session") == {"text": "first"}
     assert await reopened.dequeue_prompt("session") == {"text": "second"}
     assert await reopened.dequeue_prompt("session") is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_admission_allows_one_immediate_turn_and_queues_the_other(store):
+    async def admit(index: int):
+        return await store.admit_prompt(
+            "session",
+            {"text": f"prompt-{index}", "deviceId": "device"},
+            force_queue=False,
+        )
+
+    first, second = await asyncio.gather(admit(1), admit(2))
+    results = {first["status"], second["status"]}
+    assert results == {"admitted", "queued"}
+    queued = await store.list_queued_prompts("session")
+    assert len(queued) == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_prompt_claim_is_durable_and_revoked_device_is_skipped(store):
+    code = await store.create_pairing("hub", 90)
+    revoked_id, _, _ = await store.exchange_pairing(code, "revoked", "hub")
+    await store.enqueue_prompt("session", {"text": "do not run", "deviceId": revoked_id})
+    code = await store.create_pairing("hub", 90)
+    device_id, _, _ = await store.exchange_pairing(code, "device", "hub")
+    await store.enqueue_prompt("session", {"text": "run me", "deviceId": device_id})
+    await store.revoke_device(revoked_id)
+
+    claimed = await store.claim_next_prompt("session")
+    assert claimed is not None
+    assert claimed["text"] == "run me"
+    assert claimed["queueId"]
+
+    reopened = Store(store.path)
+    pending = await reopened.list_queued_prompts("session")
+    assert pending == []
+
+
+@pytest.mark.asyncio
+async def test_claimed_attachment_bytes_still_count_against_quota(store, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"12345678")
+    second.write_bytes(b"abcdefgh")
+    await store.record_attachment("one", "device", "session", "one.txt", "text/plain", first, "a", 8, device_quota_bytes=12)
+    await store.claim_attachments("device", "session", ["one"])
+    with pytest.raises(ValueError, match="device attachment quota"):
+        await store.record_attachment("two", "device", "session", "two.txt", "text/plain", second, "b", 8, device_quota_bytes=12)
 
 
 async def test_approval_pending_requires_exact_session_run_and_request(store):

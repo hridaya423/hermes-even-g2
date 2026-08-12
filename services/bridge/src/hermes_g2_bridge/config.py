@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     attachment_total_quota_bytes: int = 1024 * 1024 * 1024
     attachment_ttl_seconds: int = 24 * 60 * 60
     attachment_chunk_bytes: int = 1024 * 1024
+    inline_image_max_bytes: int = 8 * 1024 * 1024
     hermes_origin: str = "http://127.0.0.1:8642"
     hermes_api_key: SecretStr
     external_base_path: str = "/hermes-g2"

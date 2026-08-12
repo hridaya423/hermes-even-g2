@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import VerificationError, VerifyMismatchError
 
 from .models import EventInput, utc_now
 
@@ -75,6 +75,15 @@ MIGRATIONS = [
     UPDATE attachments SET expires_at=strftime('%Y-%m-%dT%H:%M:%f+00:00', created_at, '+1 day') WHERE expires_at IS NULL;
     CREATE INDEX IF NOT EXISTS attachments_expiry ON attachments(expires_at);
     """,
+    """
+    CREATE TABLE IF NOT EXISTS prompt_queue(
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, device_id TEXT NOT NULL,
+      payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+      created_at TEXT NOT NULL, claimed_at TEXT, claim_token TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS prompt_queue_session_status ON prompt_queue(session_id, status, created_at);
+    """,
 ]
 
 
@@ -86,8 +95,9 @@ SCOPES = {
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, attachments_root: Path | None = None):
         self.path = path
+        self.attachments_root = attachments_root
         self._ph = PasswordHasher()
         self._condition = asyncio.Condition()
 
@@ -137,6 +147,20 @@ class Store:
                             (index,),
                         )
                         continue
+                if index == 5:
+                    await db.executescript(sql)
+                    columns = {
+                        row["name"]
+                        for row in await db.execute_fetchall("PRAGMA table_info(session_state)")
+                    }
+                    if "active_admission_id" not in columns:
+                        await db.execute("ALTER TABLE session_state ADD COLUMN active_admission_id TEXT")
+                    if "active_admission_at" not in columns:
+                        await db.execute("ALTER TABLE session_state ADD COLUMN active_admission_at TEXT")
+                    await db.execute(
+                        "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", (index,)
+                    )
+                    continue
                 await db.executescript(sql)
                 await db.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", (index,)
@@ -182,9 +206,37 @@ class Store:
             return None
         try:
             self._ph.verify(row["credential_hash"], credential)
-        except VerifyMismatchError:
+        except (VerificationError, VerifyMismatchError):
             return None
         return {"id": row["id"], "kind": row["kind"], "scopes": json.loads(row["scopes_json"])}
+
+    async def is_device_active(self, device_id: str) -> bool:
+        async with self.connect() as db:
+            row = await (await db.execute(
+                "SELECT revoked_at,expires_at FROM devices WHERE id=?", (device_id,)
+            )).fetchone()
+        return bool(
+            row
+            and row["revoked_at"] is None
+            and (not row["expires_at"] or row["expires_at"] > utc_now().isoformat())
+        )
+
+    async def device_exists(self, device_id: str) -> bool:
+        async with self.connect() as db:
+            row = await (await db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,))).fetchone()
+        return row is not None
+
+    async def revoke_device(self, device_id: str) -> bool:
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            result = await db.execute(
+                "UPDATE devices SET revoked_at=COALESCE(revoked_at,?) WHERE id=?",
+                (utc_now().isoformat(), device_id),
+            )
+            await db.commit()
+        async with self._condition:
+            self._condition.notify_all()
+        return result.rowcount > 0
 
     async def record_attachment(
         self,
@@ -205,11 +257,11 @@ class Store:
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             device_usage = await (await db.execute(
-                "SELECT COALESCE(SUM(size),0) usage FROM attachments WHERE device_id=? AND consumed_at IS NULL",
+                "SELECT COALESCE(SUM(size),0) usage FROM attachments WHERE device_id=?",
                 (device_id,),
             )).fetchone()
             total_usage = await (await db.execute(
-                "SELECT COALESCE(SUM(size),0) usage FROM attachments WHERE consumed_at IS NULL"
+                "SELECT COALESCE(SUM(size),0) usage FROM attachments"
             )).fetchone()
             if device_quota_bytes is not None and device_usage["usage"] + size > device_quota_bytes:
                 await db.rollback()
@@ -248,10 +300,32 @@ class Store:
                     f"DELETE FROM attachments WHERE id IN ({placeholders})",
                     [row["id"] for row in rows],
                 )
+            known_paths = {
+                str(Path(row["path"]).resolve())
+                for row in await db.execute_fetchall("SELECT path FROM attachments")
+            }
             await db.commit()
         for row in rows:
             Path(row["path"]).unlink(missing_ok=True)
-        return len(rows)
+        orphan_count = 0
+        if self.attachments_root and self.attachments_root.exists():
+            root = self.attachments_root.resolve()
+            for path in self.attachments_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                if root not in resolved.parents:
+                    continue
+                if str(resolved) not in known_paths:
+                    path.unlink(missing_ok=True)
+                    orphan_count += 1
+            for directory in sorted(self.attachments_root.rglob("*"), reverse=True):
+                if directory.is_dir():
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
+        return len(rows) + orphan_count
 
     async def delete_consumed_attachments(
         self, session_id: str, attachment_ids: list[str]
@@ -348,7 +422,9 @@ class Store:
             )).fetchone()
         return int(row["oldest"]), int(row["latest"])
 
-    async def event_stream(self, after: int) -> AsyncIterator[dict[str, Any]]:
+    async def event_stream(
+        self, after: int, *, device_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         cursor = after
         oldest, latest = await self.event_bounds()
         if after > 0 and oldest > 0 and after < oldest - 1:
@@ -360,15 +436,21 @@ class Store:
                 "requiresSnapshot": True,
             }
         while True:
+            if device_id is not None and not await self.is_device_active(device_id):
+                yield {"type": "auth.revoked", "deviceId": device_id}
+                return
             events = await self.events_after(cursor)
             if events:
                 for event in events:
+                    if device_id is not None and not await self.is_device_active(device_id):
+                        yield {"type": "auth.revoked", "deviceId": device_id}
+                        return
                     cursor = event["cursor"]
                     yield event
                 continue
             async with self._condition:
                 try:
-                    await asyncio.wait_for(self._condition.wait(), timeout=20)
+                    await asyncio.wait_for(self._condition.wait(), timeout=2)
                 except TimeoutError:
                     yield {"type": "keepalive", "cursor": cursor}
 
@@ -440,7 +522,7 @@ class Store:
         async with self.connect() as db:
             # Only the placeholder count is interpolated; every session ID remains parameterized.
             state_rows = await db.execute_fetchall(
-                f"SELECT session_id,pinned,queued_prompts_json,source_override FROM session_state WHERE session_id IN ({placeholders})",
+                f"SELECT session_id,pinned,queued_prompts_json,source_override,active_run_id,active_admission_id FROM session_state WHERE session_id IN ({placeholders})",
                 session_ids,
             )
             lifecycle_rows = await db.execute_fetchall(
@@ -456,7 +538,9 @@ class Store:
             overlays[row["session_id"]]["pinned"] = bool(row["pinned"])
             if row["source_override"]:
                 overlays[row["session_id"]]["source"] = row["source_override"]
-            if json.loads(row["queued_prompts_json"]):
+            if row["active_run_id"] or row["active_admission_id"]:
+                overlays[row["session_id"]]["state"] = "busy"
+            elif json.loads(row["queued_prompts_json"]):
                 overlays[row["session_id"]]["state"] = "queued"
         for row in lifecycle_rows:
             if overlays[row["session_id"]]["state"] != "queued":
@@ -484,6 +568,12 @@ class Store:
 
     async def session_turn_active(self, session_id: str) -> bool:
         async with self.connect() as db:
+            state = await (await db.execute(
+                "SELECT active_run_id,active_admission_id FROM session_state WHERE session_id=?",
+                (session_id,),
+            )).fetchone()
+            if state and (state["active_run_id"] or state["active_admission_id"]):
+                return True
             row = await (await db.execute(
                 "SELECT kind FROM events WHERE session_id=? AND kind IN "
                 "('run.started','run.completed','run.failed','run.cancelled') "
@@ -532,6 +622,40 @@ class Store:
             )
             await db.commit()
 
+    async def bind_admission(
+        self,
+        admission_id: str,
+        queue_id: str | None,
+        session_id: str,
+        run_id: str,
+        device_id: str,
+    ) -> None:
+        """Convert a durable prompt admission into the provider run atomically."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            state = await (await db.execute(
+                "SELECT active_admission_id FROM session_state WHERE session_id=?",
+                (session_id,),
+            )).fetchone()
+            if not state or state["active_admission_id"] != admission_id:
+                await db.rollback()
+                raise ValueError("prompt admission is stale or already bound")
+            await db.execute(
+                "INSERT INTO run_correlation(run_id,session_id,device_id,initiated_by_g2,status,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET session_id=excluded.session_id,device_id=excluded.device_id,status=excluded.status,updated_at=excluded.updated_at",
+                (run_id, session_id, device_id, 1, "started", utc_now().isoformat()),
+            )
+            await db.execute(
+                "UPDATE session_state SET active_run_id=?,active_admission_id=NULL,active_admission_at=NULL,updated_at=? WHERE session_id=? AND active_admission_id=?",
+                (run_id, utc_now().isoformat(), session_id, admission_id),
+            )
+            if queue_id:
+                await db.execute(
+                    "UPDATE prompt_queue SET status='running',updated_at=? WHERE id=? AND claim_token=?",
+                    (utc_now().isoformat(), queue_id, admission_id),
+                )
+            await db.commit()
+
     async def audit(self, device_id: str | None, action: str, session_id: str | None, run_id: str | None, outcome: str, detail: dict[str, Any] | None = None) -> None:
         fingerprint = lambda value: hashlib.sha256(value.encode()).hexdigest()[:12] if value else None
         async with self.connect() as db:
@@ -558,19 +682,26 @@ class Store:
             return True
 
     async def enqueue_prompt(self, session_id: str, item: dict[str, Any]) -> int:
+        queue_id = str(uuid.uuid4())
+        now = utc_now().isoformat()
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             row = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
             queue = json.loads(row["queued_prompts_json"]) if row else []
             queue.append(item)
             await db.execute(
+                "INSERT INTO prompt_queue(id,session_id,device_id,payload_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (queue_id, session_id, str(item.get("deviceId", "")), json.dumps(item), "queued", now, now),
+            )
+            await db.execute(
                 "INSERT INTO session_state(session_id,queued_prompts_json,updated_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET queued_prompts_json=excluded.queued_prompts_json,updated_at=excluded.updated_at",
-                (session_id, json.dumps(queue), utc_now().isoformat()),
+                (session_id, json.dumps(queue), now),
             )
             await db.commit()
             return len(queue)
 
     async def dequeue_prompt(self, session_id: str) -> dict[str, Any] | None:
+        """Legacy destructive dequeue retained for compatibility with older callers."""
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             row = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
@@ -579,6 +710,145 @@ class Store:
                 await db.rollback()
                 return None
             item = queue.pop(0)
+            queue_row = await (await db.execute(
+                "SELECT id FROM prompt_queue WHERE session_id=? AND status='queued' ORDER BY created_at LIMIT 1",
+                (session_id,),
+            )).fetchone()
+            if queue_row:
+                await db.execute("DELETE FROM prompt_queue WHERE id=?", (queue_row["id"],))
             await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
             await db.commit()
             return item
+
+    async def admit_prompt(
+        self, session_id: str, item: dict[str, Any], *, force_queue: bool = False
+    ) -> dict[str, Any]:
+        """Persist a prompt before admitting it, atomically serializing one turn per session."""
+        queue_id = str(uuid.uuid4())
+        admission_id = str(uuid.uuid4())
+        now = utc_now().isoformat()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            state = await (await db.execute(
+                "SELECT active_run_id,active_admission_id,queued_prompts_json FROM session_state WHERE session_id=?",
+                (session_id,),
+            )).fetchone()
+            latest = await (await db.execute(
+                "SELECT kind FROM events WHERE session_id=? AND kind IN ('run.started','run.completed','run.failed','run.cancelled') ORDER BY cursor DESC LIMIT 1",
+                (session_id,),
+            )).fetchone()
+            busy = bool(
+                force_queue
+                or (state and (state["active_run_id"] or state["active_admission_id"]))
+                or (latest and latest["kind"] == "run.started")
+            )
+            status = "queued" if busy else "admitted"
+            await db.execute(
+                "INSERT INTO prompt_queue(id,session_id,device_id,payload_json,status,created_at,claimed_at,claim_token,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (queue_id, session_id, str(item.get("deviceId", "")), json.dumps(item), status, now, now if not busy else None, admission_id if not busy else None, now),
+            )
+            if busy:
+                queue = json.loads(state["queued_prompts_json"]) if state else []
+                queue.append(item)
+                await db.execute(
+                    "INSERT INTO session_state(session_id,queued_prompts_json,updated_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET queued_prompts_json=excluded.queued_prompts_json,updated_at=excluded.updated_at",
+                    (session_id, json.dumps(queue), now),
+                )
+                await db.commit()
+                return {"status": "queued", "queueId": queue_id, "position": len(queue)}
+            await db.execute(
+                "INSERT INTO session_state(session_id,active_admission_id,active_admission_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET active_admission_id=excluded.active_admission_id,active_admission_at=excluded.active_admission_at,updated_at=excluded.updated_at",
+                (session_id, admission_id, now, now),
+            )
+            await db.commit()
+            return {"status": "admitted", "queueId": queue_id, "admissionId": admission_id}
+
+    async def claim_next_prompt(self, session_id: str) -> dict[str, Any] | None:
+        """Claim one queued prompt without deleting it, so a crash cannot silently drop it."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            while True:
+                row = await (await db.execute(
+                    "SELECT * FROM prompt_queue WHERE session_id=? AND status='queued' ORDER BY created_at LIMIT 1",
+                    (session_id,),
+                )).fetchone()
+                if not row:
+                    await db.rollback()
+                    return None
+                if not await self._device_active_in_db(db, row["device_id"]):
+                    await db.execute("DELETE FROM prompt_queue WHERE id=?", (row["id"],))
+                    state = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
+                    queue = json.loads(state["queued_prompts_json"]) if state else []
+                    if queue:
+                        queue.pop(0)
+                        await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
+                    continue
+                claim_token = str(uuid.uuid4())
+                now = utc_now().isoformat()
+                await db.execute(
+                    "UPDATE prompt_queue SET status='claimed',claimed_at=?,claim_token=?,updated_at=? WHERE id=?",
+                    (now, claim_token, now, row["id"]),
+                )
+                await db.execute(
+                    "INSERT INTO session_state(session_id,active_admission_id,active_admission_at,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET active_admission_id=excluded.active_admission_id,active_admission_at=excluded.active_admission_at,updated_at=excluded.updated_at",
+                    (session_id, claim_token, now, now),
+                )
+                await db.commit()
+                value = json.loads(row["payload_json"])
+                return {**value, "queueId": row["id"], "claimToken": claim_token}
+
+    async def complete_prompt(self, queue_id: str, session_id: str) -> None:
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("DELETE FROM prompt_queue WHERE id=?", (queue_id,))
+            state = await (await db.execute("SELECT queued_prompts_json FROM session_state WHERE session_id=?", (session_id,))).fetchone()
+            queue = json.loads(state["queued_prompts_json"]) if state else []
+            if queue:
+                queue.pop(0)
+                await db.execute("UPDATE session_state SET queued_prompts_json=?,updated_at=? WHERE session_id=?", (json.dumps(queue), utc_now().isoformat(), session_id))
+            await db.commit()
+
+    async def release_admission(self, session_id: str, admission_id: str) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                "UPDATE session_state SET active_admission_id=NULL,active_admission_at=NULL,updated_at=? WHERE session_id=? AND active_admission_id=?",
+                (utc_now().isoformat(), session_id, admission_id),
+            )
+            await db.execute(
+                "UPDATE prompt_queue SET status='interrupted',updated_at=? WHERE session_id=? AND claim_token=? AND status='admitted'",
+                (utc_now().isoformat(), session_id, admission_id),
+            )
+            await db.commit()
+
+    async def recover_prompt_admissions(self) -> list[dict[str, Any]]:
+        """Mark pre-crash admissions interrupted; callers can surface a retry affordance."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            rows = await db.execute_fetchall(
+                "SELECT * FROM prompt_queue WHERE status IN ('admitted','claimed')"
+            )
+            if rows:
+                await db.execute(
+                    "UPDATE prompt_queue SET status='interrupted',updated_at=? WHERE status IN ('admitted','claimed')",
+                    (utc_now().isoformat(),),
+                )
+                await db.execute(
+                    "UPDATE session_state SET active_admission_id=NULL,active_admission_at=NULL,updated_at=? WHERE active_admission_id IS NOT NULL",
+                    (utc_now().isoformat(),),
+                )
+            await db.commit()
+        return [json.loads(row["payload_json"]) | {"queueId": row["id"]} for row in rows]
+
+    async def list_queued_prompts(self, session_id: str) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            rows = await db.execute_fetchall(
+                "SELECT payload_json,id,status FROM prompt_queue WHERE session_id=? AND status='queued' ORDER BY created_at",
+                (session_id,),
+            )
+        return [json.loads(row["payload_json"]) | {"queueId": row["id"]} for row in rows]
+
+    @staticmethod
+    async def _device_active_in_db(db: aiosqlite.Connection, device_id: str) -> bool:
+        row = await (await db.execute("SELECT revoked_at,expires_at FROM devices WHERE id=?", (device_id,))).fetchone()
+        return bool(row and row["revoked_at"] is None and (not row["expires_at"] or row["expires_at"] > utc_now().isoformat()))

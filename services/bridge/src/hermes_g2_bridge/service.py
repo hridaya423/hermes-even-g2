@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 from .hermes import HermesClient
 from .models import ActionKind, AgentAction, EventInput, utc_now
+from .security import redact
 from .store import Store
 from .summary import summarize
 
@@ -16,6 +18,57 @@ APPROVAL_MAP = {
     ActionKind.APPROVE_ALWAYS: "always",
     ActionKind.DENY: "deny",
 }
+
+
+def _bounded_text(value: Any, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = redact(str(value))
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def sanitize_event_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep useful progress while ensuring secrets and raw tool inputs never persist."""
+    value = redact(payload)
+    if not isinstance(value, dict):
+        return {"value": _bounded_text(value, 2000)}
+    sanitized: dict[str, Any] = {}
+    secret_keys = {
+        "api_key", "apikey", "authorization", "credential", "environment", "env",
+        "headers", "input", "arguments", "args", "request", "raw", "secret",
+        "password", "token", "metadata",
+    }
+    long_text_keys = {"stdout", "stderr", "output", "details", "error", "reason"}
+    for key, item in value.items():
+        lowered = str(key).lower().replace("-", "_")
+        if lowered in secret_keys or any(term in lowered for term in ("password", "token", "secret", "credential")) or (lowered in {"stdout", "stderr", "output"} and kind != "message.completed"):
+            sanitized[key] = "<redacted>"
+        elif lowered in long_text_keys:
+            sanitized[key] = _bounded_text(item, 2000)
+        elif lowered in {"command", "cwd", "path", "destination", "rule", "tool", "tool_name"}:
+            sanitized[key] = _bounded_text(item, 1000)
+        elif lowered in {"content", "message", "text", "summary"}:
+            sanitized[key] = _bounded_text(item, 12000 if kind == "message.completed" else 2000)
+        else:
+            sanitized[key] = item
+    return sanitized
+
+
+def _encode_image_data_url(path: Path, media_type: str, size: int, max_bytes: int) -> str:
+    if size > max_bytes:
+        raise ValueError("image attachment is too large to send inline")
+    encoded = io.StringIO()
+    carry = b""
+    with path.open("rb") as source:
+        while chunk := source.read(60 * 1024):
+            data = carry + chunk
+            usable = len(data) - (len(data) % 3)
+            if usable:
+                encoded.write(base64.b64encode(data[:usable]).decode("ascii"))
+            carry = data[usable:]
+    if carry:
+        encoded.write(base64.b64encode(carry).decode("ascii"))
+    return f"data:{media_type};base64,{encoded.getvalue()}"
 
 
 class ControlService:
@@ -28,6 +81,7 @@ class ControlService:
         whisper_binary,
         whisper_model,
         tailscale_cli,
+        inline_image_max_bytes: int = 8 * 1024 * 1024,
     ):
         self.store = store
         self.hermes = hermes
@@ -36,6 +90,7 @@ class ControlService:
         self.whisper_binary = whisper_binary
         self.whisper_model = whisper_model
         self.tailscale_cli = tailscale_cli
+        self.inline_image_max_bytes = inline_image_max_bytes
         self.capabilities: dict[str, Any] = {}
         self.runtime: dict[str, Any] = {"bridge": True, "hermes": False, "coreReady": False, "guiReady": False}
         self._tasks: set[asyncio.Task] = set()
@@ -78,19 +133,19 @@ class ControlService:
             session_id = str(session.get("id", session.get("session_id", "")))
             updated_at = str(session.get("updated_at", session.get("updatedAt", "")))
             if session_id and await self.store.observe_session(session_id, updated_at):
-                await self.store.append_event(EventInput(kind="session.updated", source="hermes", sessionId=session_id, payload=session))
+                await self.store.append_event(EventInput(kind="session.updated", source="hermes", sessionId=session_id, payload=sanitize_event_payload("session.updated", session)))
                 changed += 1
             if session_id and session.get("state") == "idle" and not await self.store.session_turn_active(session_id):
-                queued = await self.store.dequeue_prompt(session_id)
+                queued = await self.store.claim_next_prompt(session_id)
                 if queued:
-                    legacy_prepared = "message" in queued
                     self._start_prompt(
                         session_id,
                         queued.get("message", queued.get("text", "")),
                         queued["deviceId"],
                         queued.get("options"),
                         queued.get("attachmentIds", []),
-                        prepared=legacy_prepared,
+                        queue_id=queued.get("queueId"),
+                        admission_id=queued.get("claimToken"),
                     )
         return changed
 
@@ -114,6 +169,8 @@ class ControlService:
             raise ValueError("action is stale")
         if action.device_id != device["id"]:
             raise ValueError("action deviceId does not match authenticated device")
+        if await self.store.device_exists(device["id"]) and not await self.store.is_device_active(device["id"]):
+            raise ValueError("device is revoked or expired")
         kind = action.kind
         required_scope = (
             "approvals:write" if kind in APPROVAL_MAP else
@@ -186,17 +243,19 @@ class ControlService:
                 raise ValueError("a prompt may include at most 10 attachments")
             if not text and not attachment_ids:
                 raise ValueError("prompt text is empty")
-            sessions = await self.sessions(limit=100)
-            target = next((item for item in sessions if item["id"] == action.session_id), None)
-            should_queue = kind == ActionKind.QUEUE_PROMPT or target is None or await self.store.session_is_busy(action.session_id)
-            if should_queue:
-                position = await self.store.enqueue_prompt(action.session_id, {
+            admission = await self.store.admit_prompt(
+                action.session_id,
+                {
                     "text": text or "Please inspect the attached file.",
                     "attachmentIds": attachment_ids,
                     "deviceId": device["id"],
                     "options": action.payload.get("options"),
                     "createdAt": action.created_at.isoformat(),
-                })
+                },
+                force_queue=kind == ActionKind.QUEUE_PROMPT,
+            )
+            if admission["status"] == "queued":
+                position = admission["position"]
                 await self.store.append_event(EventInput(kind="session.updated", source="bridge", sessionId=action.session_id, payload={"state": "queued", "queuePosition": position}))
                 return {"status": "queued", "sessionId": action.session_id, "position": position}
             self._start_prompt(
@@ -205,6 +264,8 @@ class ControlService:
                 device["id"],
                 action.payload.get("options"),
                 attachment_ids,
+                queue_id=admission["queueId"],
+                admission_id=admission["admissionId"],
             )
             return {"status": "started", "sessionId": action.session_id}
         if kind in {ActionKind.RUN_JOB, ActionKind.PAUSE_JOB, ActionKind.RESUME_JOB}:
@@ -236,11 +297,10 @@ class ControlService:
         for item in attachments:
             if not item["mediaType"].startswith("image/"):
                 continue
-            encoded = base64.b64encode(Path(item["path"]).read_bytes()).decode()
             image_parts.append({
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:{item['mediaType']};base64,{encoded}",
+                    "url": _encode_image_data_url(Path(item["path"]), item["mediaType"], int(item["size"]), self.inline_image_max_bytes),
                     "detail": "auto",
                 },
             })
@@ -257,6 +317,8 @@ class ControlService:
         attachment_ids: list[str],
         *,
         prepared: bool = False,
+        queue_id: str | None = None,
+        admission_id: str | None = None,
     ) -> None:
         task = asyncio.create_task(
             self._run_prompt(
@@ -266,6 +328,8 @@ class ControlService:
                 options,
                 attachment_ids,
                 prepared=prepared,
+                queue_id=queue_id,
+                admission_id=admission_id,
             )
         )
         self._tasks.add(task)
@@ -280,10 +344,14 @@ class ControlService:
         attachment_ids: list[str],
         *,
         prepared: bool = False,
+        queue_id: str | None = None,
+        admission_id: str | None = None,
     ) -> None:
         run_id = None
         provider_failure = None
         try:
+            if not await self.store.is_device_active(device_id):
+                raise ValueError("device was revoked before prompt execution")
             if not prepared:
                 message = await self.prepare_prompt(
                     session_id,
@@ -304,10 +372,13 @@ class ControlService:
                 kind = {"assistant.completed": "message.completed", "approval.request": "approval.required", "done": "run.progress", "error": "run.failed"}.get(kind, kind)
                 durable = kind not in {"assistant.delta", "message.delta", "token"}
                 if durable:
-                    payload = {**raw, "initiatedByG2": True}
+                    payload = {**sanitize_event_payload(kind, raw), "initiatedByG2": True}
                     if run_id and kind in {"run.started", "run.completed", "run.failed", "run.cancelled"}:
                         status = kind.removeprefix("run.")
-                        await self.store.update_run(run_id, session_id, device_id, status, True)
+                        if kind == "run.started" and admission_id:
+                            await self.store.bind_admission(admission_id, queue_id, session_id, run_id, device_id)
+                        else:
+                            await self.store.update_run(run_id, session_id, device_id, status, True)
                     if kind == "message.completed":
                         content = str(raw.get("content") or raw.get("message") or raw.get("text") or "")
                         if content:
@@ -323,15 +394,15 @@ class ControlService:
                             "sessionId": session_id,
                             "runId": run_id,
                             "tool": str(raw.get("tool") or raw.get("tool_name") or "tool"),
-                            "command": raw.get("command"),
-                            "destination": raw.get("destination"),
-                            "rule": raw.get("rule"),
+                            "command": _bounded_text(raw.get("command"), 1000),
+                            "destination": _bounded_text(raw.get("destination"), 1000),
+                            "rule": _bounded_text(raw.get("rule"), 1000),
                             "destructive": bool(raw.get("destructive")),
                             "sensitive": bool(raw.get("sensitive") or raw.get("secret_bearing")),
-                            "choices": raw.get("choices", ["once", "session", "always", "deny"]),
+                            "choices": [str(choice) for choice in raw.get("choices", ["once", "session", "always", "deny"])][:8],
                             "expiresAt": raw.get("expires_at"),
                         }
-                    await self.store.append_event(EventInput(kind=kind if kind in EVENT_KINDS else "run.progress", source="hermes", sessionId=session_id, runId=run_id, payload=payload))
+                    await self.store.append_event(EventInput(kind=kind if kind in EVENT_KINDS else "run.progress", source="hermes", sessionId=session_id, runId=run_id, payload=sanitize_event_payload(kind, payload)))
             await self.store.audit(
                 device_id,
                 "prompt",
@@ -343,10 +414,14 @@ class ControlService:
         except Exception as error:
             if run_id:
                 await self.store.update_run(run_id, session_id, device_id, "failed", True)
-            await self.store.append_event(EventInput(kind="run.failed", source="bridge", sessionId=session_id, runId=run_id, payload={"error": str(error)[:500]}))
+            await self.store.append_event(EventInput(kind="run.failed", source="bridge", sessionId=session_id, runId=run_id, payload=sanitize_event_payload("run.failed", {"error": str(error)[:500]})))
             await self.store.audit(device_id, "prompt", session_id, run_id, "failed", {"errorType": type(error).__name__})
         finally:
             await self.store.delete_consumed_attachments(session_id, attachment_ids)
+            if queue_id:
+                await self.store.complete_prompt(queue_id, session_id)
+            if admission_id:
+                await self.store.release_admission(session_id, admission_id)
 
 
 EVENT_KINDS = {"runtime.updated", "session.created", "session.updated", "message.completed", "run.started", "run.progress", "run.completed", "run.failed", "run.cancelled", "tool.started", "tool.completed", "tool.failed", "approval.required", "approval.resolved", "subagent.started", "subagent.completed", "job.updated", "attention.created", "attention.resolved"}

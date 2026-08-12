@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import Settings
 from .hermes import HermesClient, HermesError
-from .models import AgentAction, EventInput, PairingExchange, utc_now
+from .models import AgentAction, EventInput, PairingExchange
 from .security import authenticate_websocket, redact, require_scope, verify_plugin
 from .service import ControlService
 from .store import Store
@@ -52,7 +52,7 @@ class ExternalBasePathMiddleware:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings()
-    store = Store(config.database_path)
+    store = Store(config.database_path, config.attachments_root)
     hermes = HermesClient(config.hermes_origin, config.hermes_api_key.get_secret_value())
     service = ControlService(
         store,
@@ -62,12 +62,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         config.whisper_binary,
         config.whisper_model,
         config.tailscale_cli,
+        config.inline_image_max_bytes,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await store.migrate()
         await store.cleanup_attachments()
+        await store.recover_prompt_admissions()
         await service.probe()
         async def reconcile():
             while True:
@@ -202,9 +204,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def revoke(device_id: str, device=Depends(require_scope("sessions:read"))):
         if device_id != device["id"] and "devices:manage" not in device["scopes"]:
             raise HTTPException(403, "device may only revoke itself")
-        async with store.connect() as db:
-            await db.execute("UPDATE devices SET revoked_at=? WHERE id=?", (utc_now().isoformat(), device_id))
-            await db.commit()
+        if not await store.revoke_device(device_id):
+            raise HTTPException(404, "device does not exist")
         await store.audit(device["id"], "revokeDevice", None, None, "completed", {"target": device_id[:8]})
         return {"status": "revoked"}
 
@@ -347,7 +348,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/events")
     async def events(after: int = Query(0, ge=0), device=Depends(require_scope("sessions:read"))):
         async def generate():
-            async for event in store.event_stream(after):
+            async for event in store.event_stream(after, device_id=device["id"]):
                 yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
         return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -368,18 +369,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         after = int(websocket.query_params.get("after", "0"))
 
         async def send_events():
-            async for event in store.event_stream(after):
+            async for event in store.event_stream(after, device_id=device["id"]):
                 await websocket.send_json(event)
+                if event.get("type") == "auth.revoked":
+                    await websocket.close(code=4403)
+                    return
 
         async def receive_acks():
-            while True:
-                message = await websocket.receive_json()
-                if message.get("type") == "ack":
-                    await store.acknowledge(device["id"], int(message["cursor"]))
+            try:
+                while True:
+                    message = await websocket.receive_json()
+                    if message.get("type") == "ack":
+                        await store.acknowledge(device["id"], int(message["cursor"]))
+            except WebSocketDisconnect:
+                return
 
         try:
-            await asyncio.gather(send_events(), receive_acks())
-        except WebSocketDisconnect:
+            sender = asyncio.create_task(send_events())
+            receiver = asyncio.create_task(receive_acks())
+            done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.gather(*done, return_exceptions=True)
+        except (WebSocketDisconnect, asyncio.CancelledError):
             return
 
     @app.post("/internal/plugin/events")

@@ -6,13 +6,14 @@ from fastapi import Header, HTTPException, Request, WebSocket
 
 from .store import Store
 
-SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|authorization|token|password|secret)(\s*[:=]\s*)([^\s,;]+)")
+SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|authorization|token|password|secret)(\s*[:=]\s*)((?!Bearer(?:\s|$))[^\s,;]+)")
+BEARER_PATTERN = re.compile(r"(?i)(bearer\s+)[^\s,;']+")
 PATH_PATTERN = re.compile(r"/(?:Users|home)/[^/\s]+/(?:[^\s]+)")
 
 
 def redact(value: Any) -> Any:
     if isinstance(value, str):
-        return PATH_PATTERN.sub("<private-path>", SECRET_PATTERN.sub(r"\1\2<redacted>", value))
+        return PATH_PATTERN.sub("<private-path>", SECRET_PATTERN.sub(r"\1\2<redacted>", BEARER_PATTERN.sub(r"\1<redacted>", value)))
     if isinstance(value, dict):
         return {key: ("<redacted>" if any(term in key.lower() for term in ("token", "secret", "password", "key")) else redact(item)) for key, item in value.items()}
     if isinstance(value, list):

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hermes_g2_bridge.models import AgentAction
-from hermes_g2_bridge.service import ControlService
+from hermes_g2_bridge.service import ControlService, sanitize_event_payload
 from hermes_g2_bridge.store import Store
 
 
@@ -191,3 +191,23 @@ async def test_queued_prompt_defers_attachment_claim_until_run_start(tmp_path: P
         )).fetchone()
     assert row["consumed_at"] is None
     assert attachment.exists()
+
+
+def test_sanitize_event_payload_removes_sensitive_run_details():
+    value = sanitize_event_payload(
+        "run.progress",
+        {
+            "phase": "tool",
+            "command": "curl -H 'Authorization: Bearer abcdefghijklmnop' /Users/alice/private.txt",
+            "stdout": "api_key=super-secret output",
+            "environment": {"TOKEN": "do-not-persist"},
+            "nested": {"password": "hidden"},
+        },
+    )
+
+    assert value["phase"] == "tool"
+    assert "Bearer <redacted>" in value["command"]
+    assert "<private-path>" in value["command"]
+    assert value["stdout"] == "<redacted>"
+    assert value["environment"] == "<redacted>"
+    assert value["nested"]["password"] == "<redacted>"
