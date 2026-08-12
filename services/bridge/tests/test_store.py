@@ -89,7 +89,7 @@ async def test_attachment_cleanup_removes_orphaned_files(tmp_path):
     root.mkdir()
     orphan = root / "orphan.bin"
     orphan.write_bytes(b"orphan")
-    store = Store(tmp_path / "bridge.db", root)
+    store = Store(tmp_path / "bridge.db", root, orphan_grace_seconds=0)
     await store.migrate()
     assert await store.cleanup_attachments() == 1
     assert not orphan.exists()

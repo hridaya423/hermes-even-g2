@@ -52,7 +52,11 @@ class ExternalBasePathMiddleware:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings()
-    store = Store(config.database_path, config.attachments_root)
+    store = Store(
+        config.database_path,
+        config.attachments_root,
+        config.attachment_orphan_grace_seconds,
+    )
     hermes = HermesClient(config.hermes_origin, config.hermes_api_key.get_secret_value())
     service = ControlService(
         store,

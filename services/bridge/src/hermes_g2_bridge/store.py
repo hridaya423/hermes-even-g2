@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import secrets
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -95,9 +96,15 @@ SCOPES = {
 
 
 class Store:
-    def __init__(self, path: Path, attachments_root: Path | None = None):
+    def __init__(
+        self,
+        path: Path,
+        attachments_root: Path | None = None,
+        orphan_grace_seconds: int = 300,
+    ):
         self.path = path
         self.attachments_root = attachments_root
+        self.orphan_grace_seconds = orphan_grace_seconds
         self._ph = PasswordHasher()
         self._condition = asyncio.Condition()
 
@@ -316,6 +323,11 @@ class Store:
                 resolved = path.resolve()
                 if root not in resolved.parents:
                     continue
+                try:
+                    if time.time() - path.stat().st_mtime < self.orphan_grace_seconds:
+                        continue
+                except OSError:
+                    continue
                 if str(resolved) not in known_paths:
                     path.unlink(missing_ok=True)
                     orphan_count += 1
@@ -451,11 +463,19 @@ class Store:
                     cursor = event["cursor"]
                     yield event
                 continue
+            revoked = False
             async with self._condition:
-                try:
-                    await asyncio.wait_for(self._condition.wait(), timeout=2)
-                except TimeoutError:
-                    yield {"type": "keepalive", "cursor": cursor}
+                revoked = device_id is not None and not await self.is_device_active(device_id)
+                if not revoked:
+                    try:
+                        await asyncio.wait_for(self._condition.wait(), timeout=2)
+                    except TimeoutError:
+                        pass
+            if revoked:
+                yield {"type": "auth.revoked", "deviceId": device_id}
+                return
+            if device_id is None or await self.is_device_active(device_id):
+                yield {"type": "keepalive", "cursor": cursor}
 
     async def idempotency_begin(
         self, device_id: str, key: str, body: bytes
