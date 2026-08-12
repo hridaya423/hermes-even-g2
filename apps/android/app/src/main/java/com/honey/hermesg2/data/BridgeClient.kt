@@ -1,19 +1,26 @@
 package com.honey.hermesg2.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class BridgeClient(private val credentials: DeviceCredentials, private val client: OkHttpClient = OkHttpClient()) {
     private val json = Json { ignoreUnknownKeys = true }
@@ -33,23 +40,54 @@ class BridgeClient(private val credentials: DeviceCredentials, private val clien
         name: String,
         mediaType: String,
         bytes: ByteArray,
-    ): AttachmentUpload = withContext(Dispatchers.IO) {
+    ): AttachmentUpload = uploadAttachment(
+        sessionId,
+        ByteArrayAttachmentSource(sessionId, name, mediaType, bytes),
+    )
+
+    suspend fun uploadAttachment(
+        sessionId: String,
+        source: AttachmentSource,
+    ): AttachmentUpload {
+        AttachmentMetadata.validateSession(sessionId)
+        require(source.sessionId == sessionId) { "Attachment target changed; select the visible session again" }
+        source.declaredSize?.let { AttachmentMetadata.validateDeclaredSize(it) }
         val url = credentials.origin.toHttpUrl().newBuilder()
             .addPathSegments("v1/attachments")
             .addQueryParameter("sessionId", sessionId)
             .build()
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("file", name, bytes.toRequestBody(mediaType.toMediaType()))
+            .addFormDataPart("file", source.name, StreamingAttachmentRequestBody(source))
             .build()
-        client.newCall(
+        val call = client.newCall(
             Request.Builder().url(url)
                 .header("Authorization", "Bearer ${credentials.credential}")
                 .header("X-Device-Id", credentials.deviceId)
                 .post(body)
                 .build()
-        ).execute().use { response ->
-            if (!response.isSuccessful) error(response.body?.string() ?: "Bridge ${response.code}")
-            json.decodeFromString(response.body!!.string())
+        )
+        return suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, error: IOException) {
+                    if (!continuation.isCancelled) continuation.resumeWithException(error)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    response.use {
+                        if (!it.isSuccessful) {
+                            if (!continuation.isCancelled) continuation.resumeWithException(IOException(it.body?.string() ?: "Bridge ${it.code}"))
+                            return
+                        }
+                        try {
+                            val result = json.decodeFromString<AttachmentUpload>(it.body?.string() ?: error("Bridge returned an empty attachment response"))
+                            if (!continuation.isCancelled) continuation.resume(result)
+                        } catch (error: Throwable) {
+                            if (!continuation.isCancelled) continuation.resumeWithException(error)
+                        }
+                    }
+                }
+            })
         }
     }
     suspend fun revokeDevice(deviceId: String): String = withContext(Dispatchers.IO) {
