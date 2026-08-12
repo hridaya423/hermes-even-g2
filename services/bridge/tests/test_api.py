@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from hermes_g2_bridge.app import create_app
@@ -298,3 +299,167 @@ def test_hermes_dependency_failures_are_clean_service_unavailable_responses(tmp_
             "detail": "Hermes GET /api/sessions is unreachable",
             "code": "hermes_unavailable",
         }
+
+
+def _action(kind: str, device_id: str, *, key: str, session_id: str | None = None,
+            run_id: str | None = None, payload: dict | None = None) -> dict:
+    return {
+        "kind": kind,
+        "deviceId": device_id,
+        "idempotencyKey": key,
+        "sessionId": session_id,
+        "runId": run_id,
+        "createdAt": datetime.now(UTC).isoformat(),
+        "payload": payload or {},
+    }
+
+
+def test_action_endpoint_matrix_routes_exact_targets_and_idempotently_rehydrates_history(tmp_path):
+    app = configured_app(tmp_path)
+    with TestClient(app) as client:
+        device, headers = pair(client, app, "android")
+        control = app.state.control
+        control.runtime["coreReady"] = True
+        control.capabilities.update(
+            models=True,
+            jobs=True,
+            sessionRunControl=True,
+            sessionApprovalResponse=True,
+        )
+        control.hermes.fork_session = AsyncMock(return_value={"id": "forked", "title": "branch"})
+        control.hermes.set_session_model = AsyncMock(return_value={"status": "accepted"})
+        control.hermes.job_action = AsyncMock(return_value={"status": "started"})
+        control.hermes.stop_run = AsyncMock(return_value={"status": "stopping"})
+        control.hermes.approve = AsyncMock(return_value={"status": "accepted"})
+        control.hermes.messages = AsyncMock(return_value={
+            "object": "list", "data": [{"id": "message-1"}], "limit": 1,
+            "offset": 2, "total": 10, "hasMore": True, "order": "newest",
+        })
+        started: list[tuple] = []
+        control._start_prompt = lambda *args, **kwargs: started.append((args, kwargs))
+
+        fork = _action(
+            "forkSession", device["deviceId"], key="fork-action-1", session_id="session-source",
+            payload={"title": "branch"},
+        )
+        first_fork = client.post("/v1/actions", headers=headers, json=fork)
+        second_fork = client.post("/v1/actions", headers=headers, json=fork)
+        changed_fork = {**fork, "payload": {"title": "different branch"}}
+        assert first_fork.status_code == second_fork.status_code == 200
+        assert first_fork.json() == second_fork.json() == {"id": "forked", "title": "branch"}
+        assert changed_fork["idempotencyKey"] == fork["idempotencyKey"]
+        assert client.post("/v1/actions", headers=headers, json=changed_fork).status_code == 409
+        control.hermes.fork_session.assert_awaited_once_with("session-source", {"title": "branch"})
+
+        prompt = client.post(
+            "/v1/actions",
+            headers=headers,
+            json=_action(
+                "prompt", device["deviceId"], key="prompt-action-1", session_id="session-target",
+                payload={"text": "continue exact session"},
+            ),
+        )
+        queued = client.post(
+            "/v1/actions",
+            headers=headers,
+            json=_action(
+                "queuePrompt", device["deviceId"], key="queue-action-1", session_id="session-target",
+                payload={"text": "later exact session"},
+            ),
+        )
+        assert prompt.status_code == 200 and prompt.json() == {"status": "started", "sessionId": "session-target"}
+        assert queued.status_code == 200 and queued.json()["status"] == "queued"
+        assert started[0][0][0] == "session-target"
+
+        model = client.post(
+            "/v1/actions",
+            headers=headers,
+            json=_action(
+                "setSessionModel", device["deviceId"], key="model-action-1", session_id="session-target",
+                payload={"provider": "openai", "model": "gpt-test"},
+            ),
+        )
+        assert model.status_code == 200
+        control.hermes.set_session_model.assert_awaited_once_with("session-target", "openai", "gpt-test")
+
+        job = client.post(
+            "/v1/actions",
+            headers=headers,
+            json=_action("runJob", device["deviceId"], key="job-action-1", payload={"jobId": "job-1"}),
+        )
+        assert job.status_code == 200
+        control.hermes.job_action.assert_awaited_once_with("job-1", "run")
+
+        client.portal.call(
+            app.state.store.update_run, "run-stop", "session-target", device["deviceId"], "started", True
+        )
+        stop = client.post(
+            "/v1/actions",
+            headers=headers,
+            json=_action(
+                "stopRun", device["deviceId"], key="stop-action-1", session_id="session-target",
+                run_id="run-stop",
+            ),
+        )
+        assert stop.status_code == 200
+        control.hermes.stop_run.assert_awaited_once_with("session-target", "run-stop")
+
+        for kind, run_id, request_id in (("approveOnce", "run-approve", "request-approve"), ("deny", "run-deny", "request-deny")):
+            client.portal.call(
+                app.state.store.append_event,
+                EventInput(
+                    kind="approval.required", source="hermes", sessionId="session-target", runId=run_id,
+                    payload={"requestId": request_id, "choices": ["once", "deny"]},
+                ),
+            )
+            approval = client.post(
+                "/v1/actions",
+                headers=headers,
+                json=_action(
+                    kind, device["deviceId"], key=f"{kind}-action-1", session_id="session-target",
+                    run_id=run_id, payload={"requestId": request_id},
+                ),
+            )
+            assert approval.status_code == 200
+
+        control.hermes.messages = AsyncMock(return_value={
+            "object": "list", "data": [{"id": "message-1"}], "limit": 2,
+            "offset": 3, "total": 20, "hasMore": True, "order": "newest",
+        })
+        history = client.get(
+            "/v1/sessions/session-target/messages?limit=2&offset=3", headers=headers
+        )
+        assert history.status_code == 200
+        assert history.json()["data"][0]["id"] == "message-1"
+        control.hermes.messages.assert_awaited_once_with("session-target", 2, 3)
+
+
+@pytest.mark.parametrize(
+    ("kind", "capability", "session_id", "run_id", "payload"),
+    [
+        ("setSessionModel", "models", "session", None, {"provider": "p", "model": "m"}),
+        ("runJob", "jobs", None, None, {"jobId": "job"}),
+        ("stopRun", "sessionRunControl", "session", "run", {}),
+        ("approveOnce", "sessionApprovalResponse", "session", "run", {"requestId": "request"}),
+    ],
+)
+def test_action_endpoint_hides_controls_when_hermes_capability_is_missing(
+    tmp_path, kind, capability, session_id, run_id, payload
+):
+    app = configured_app(tmp_path)
+    with TestClient(app) as client:
+        device, headers = pair(client, app, "android")
+        control = app.state.control
+        control.runtime["coreReady"] = True
+        control.capabilities.update(models=True, jobs=True, sessionRunControl=True, sessionApprovalResponse=True)
+        control.capabilities[capability] = False
+        response = client.post(
+            "/v1/actions",
+            headers=headers,
+            json=_action(
+                kind, device["deviceId"], key=f"missing-{kind}-1", session_id=session_id,
+                run_id=run_id, payload=payload,
+            ),
+        )
+        assert response.status_code == 409
+        assert "does not advertise" in response.json()["detail"]

@@ -13,6 +13,10 @@ class HermesError(RuntimeError):
         self.status_code = status_code
 
 
+MAX_MESSAGE_PAGE_SIZE = 200
+MAX_MESSAGE_TEXT = 12_000
+
+
 class HermesClient:
     def __init__(self, origin: str, api_key: str):
         self.origin = origin.rstrip("/")
@@ -82,18 +86,77 @@ class HermesClient:
         }
 
     async def messages(self, session_id: str, limit: int = 100, offset: int = 0) -> Any:
-        value = await self._request("GET", f"/api/sessions/{session_id}/messages")
+        # Hermes 0.20 currently returns the complete history, while newer builds
+        # may add limit/offset metadata. Always send the pagination hints so an
+        # upstream that supports them can avoid materialising the full transcript;
+        # the fallback below retains the same newest-first contract for 0.20.
+        effective_limit = max(1, min(int(limit), MAX_MESSAGE_PAGE_SIZE))
+        effective_offset = max(0, int(offset))
+        value = await self._request(
+            "GET",
+            f"/api/sessions/{session_id}/messages",
+            params={"limit": effective_limit, "offset": effective_offset},
+        )
         rows = value.get("data", value.get("messages", [])) if isinstance(value, dict) else value
-        normalized = [self._normalize_message(item, session_id) for item in reversed(rows)]
+        if not isinstance(rows, list):
+            rows = []
+
+        # A paginated upstream response owns the requested window. Respect its
+        # explicit ordering hint and metadata instead of applying the legacy
+        # whole-history tail calculation a second time.
+        metadata_keys = {"has_more", "hasMore", "next_offset", "nextOffset", "total", "offset", "limit", "order"}
+        upstream_paged = isinstance(value, dict) and bool(metadata_keys & value.keys())
+        order = str(value.get("order", "") if isinstance(value, dict) else "").lower()
+        if upstream_paged:
+            if order in {"asc", "ascending", "oldest", "chronological"}:
+                rows = list(reversed(rows))
+            rows = rows[:effective_limit]
+            total = self._page_number(value, "total")
+            has_more = self._page_bool(value, "has_more", "hasMore")
+            if has_more is None:
+                has_more = bool(total is not None and effective_offset + len(rows) < total)
+            total = total if total is not None else effective_offset + len(rows) + (1 if has_more else 0)
+            normalized = [self._normalize_message(item, session_id) for item in rows if isinstance(item, dict)]
+        else:
+            # Legacy Hermes returns oldest-first without any pagination envelope.
+            # Index the tail directly so only one bounded page is normalised; this
+            # avoids a second list containing the entire history on large sessions.
+            total = len(rows)
+            start = max(0, total - effective_offset - effective_limit)
+            end = max(start, total - effective_offset)
+            normalized = [
+                self._normalize_message(rows[index], session_id)
+                for index in range(end - 1, start - 1, -1)
+                if isinstance(rows[index], dict)
+            ]
+            has_more = effective_offset + effective_limit < total
         return {
             "object": "list",
-            "data": normalized[offset:offset + limit],
-            "limit": limit,
-            "offset": offset,
-            "total": len(normalized),
-            "hasMore": offset + limit < len(normalized),
+            "data": normalized,
+            "limit": effective_limit,
+            "offset": effective_offset,
+            "total": total,
+            "hasMore": has_more,
             "order": "newest",
         }
+
+    @staticmethod
+    def _page_number(value: dict[str, Any], key: str) -> int | None:
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            return None
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max(0, number)
+
+    @classmethod
+    def _page_bool(cls, value: dict[str, Any], *keys: str) -> bool | None:
+        for key in keys:
+            if key in value and isinstance(value[key], bool):
+                return value[key]
+        return None
 
     @staticmethod
     def _normalize_message(value: dict[str, Any], session_id: str) -> dict[str, Any]:
@@ -104,8 +167,8 @@ class HermesClient:
             "id": str(value.get("id") or ""),
             "sessionId": str(value.get("session_id") or session_id),
             "role": role,
-            "content": str(value.get("content") or ""),
-            "reasoning": value.get("reasoning") or value.get("reasoning_content"),
+            "content": str(value.get("content") or "")[:MAX_MESSAGE_TEXT],
+            "reasoning": str(value.get("reasoning") or value.get("reasoning_content"))[:MAX_MESSAGE_TEXT] if value.get("reasoning") or value.get("reasoning_content") else None,
             "timestamp": HermesClient._normalize_timestamp(value.get("timestamp")),
             "finishReason": value.get("finish_reason"),
             "toolName": value.get("tool_name"),

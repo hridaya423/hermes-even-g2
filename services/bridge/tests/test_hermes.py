@@ -65,6 +65,100 @@ async def test_messages_normalize_live_envelope_and_paginate_newest_first():
     await value.close()
 
 
+async def test_messages_sends_upstream_hints_and_bounds_normalized_large_history():
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["params"] = dict(request.url.params)
+        rows = [
+            {
+                "id": str(index),
+                "session_id": "s",
+                "role": "assistant",
+                "content": "x" * (50_000 if index == 9992 else 1),
+            }
+            for index in range(10_000)
+        ]
+        return httpx.Response(200, json={"data": rows})
+
+    value = HermesClient("http://hermes.test", "secret")
+    await value.client.aclose()
+    value.client = httpx.AsyncClient(
+        base_url="http://hermes.test", transport=httpx.MockTransport(handler)
+    )
+
+    page = await value.messages("s", limit=3, offset=7)
+
+    # Hermes 0.20 ignores the hints and returns the complete oldest-first list;
+    # the bridge still exposes the newest-first page without normalising all
+    # 10,000 messages or retaining unbounded message text.
+    assert captured["params"] == {"limit": "3", "offset": "7"}
+    assert [message["id"] for message in page["data"]] == ["9992", "9991", "9990"]
+    assert page["total"] == 10_000
+    assert page["hasMore"] is True
+    assert len(page["data"][0]["content"]) == 12_000
+    await value.close()
+
+
+async def test_messages_accepts_explicit_upstream_page_metadata_and_order():
+    value = HermesClient("http://hermes.test", "secret")
+    await value.client.aclose()
+    value.client = httpx.AsyncClient(
+        base_url="http://hermes.test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "newest", "session_id": "s", "role": "assistant", "content": "done"},
+                    {"id": "older", "session_id": "s", "role": "user", "content": "go"},
+                ],
+                "offset": 0,
+                "limit": 2,
+                "total": 20,
+                "has_more": True,
+                "order": "desc",
+            },
+        )),
+    )
+
+    page = await value.messages("s", limit=2, offset=0)
+
+    assert [message["id"] for message in page["data"]] == ["newest", "older"]
+    assert page["total"] == 20
+    assert page["hasMore"] is True
+    await value.close()
+
+
+async def test_fork_session_targets_exact_native_session_and_preserves_payload():
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = request.content
+        return httpx.Response(
+            201,
+            json={"object": "hermes.session", "session": {"id": "forked", "parent_session_id": "source"}},
+        )
+
+    value = HermesClient("http://hermes.test", "secret")
+    await value.client.aclose()
+    value.client = httpx.AsyncClient(
+        base_url="http://hermes.test", transport=httpx.MockTransport(handler)
+    )
+
+    forked = await value.fork_session("source", {"title": "alternate path"})
+
+    assert captured == {
+        "method": "POST",
+        "path": "/api/sessions/source/fork",
+        "body": b'{"title":"alternate path"}',
+    }
+    assert forked["id"] == "forked"
+    assert forked["parentSessionId"] == "source"
+    await value.close()
+
+
 async def test_session_stream_preserves_sse_event_names():
     body = (
         'event: run.started\ndata: {"run_id":"run-1"}\n\n'
