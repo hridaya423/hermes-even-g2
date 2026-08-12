@@ -426,6 +426,9 @@ class Store:
         self, after: int, *, device_id: str | None = None
     ) -> AsyncIterator[dict[str, Any]]:
         cursor = after
+        if device_id is not None and not await self.is_device_active(device_id):
+            yield {"type": "auth.revoked", "deviceId": device_id}
+            return
         oldest, latest = await self.event_bounds()
         if after > 0 and oldest > 0 and after < oldest - 1:
             yield {
