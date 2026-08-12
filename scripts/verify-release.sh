@@ -12,7 +12,7 @@ npm run typecheck
 npm run build
 npm test
 cd "$project_dir/apps/android"
-JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ANDROID_HOME="$HOME/Library/Android/sdk" ./gradlew --no-daemon assembleDebug testDebugUnitTest
+JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ANDROID_HOME="$HOME/Library/Android/sdk" ./gradlew --no-daemon --rerun-tasks assembleDebug testDebugUnitTest
 swift build -c release --package-path "$project_dir/services/apple-summary-helper"
 zsh -n "$project_dir"/scripts/*.sh
 zsh "$project_dir/scripts/test-verify-release.sh"
