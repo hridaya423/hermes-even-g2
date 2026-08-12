@@ -1,9 +1,10 @@
 import {useEffect, useMemo, useRef, useState} from "react";
 import {CreateStartUpPageContainer, RebuildPageContainer, TextContainerProperty, waitForEvenAppBridge} from "@evenrealities/even_hub_sdk";
-import type {AgentAction, AgentMessage, ApprovalChoice, ApprovalRequest, DurableEvent, SessionSummary} from "@hermes-g2/protocol";
+import type {AgentAction, ApprovalChoice, ApprovalRequest, DurableEvent, SessionSummary} from "@hermes-g2/protocol";
 import {BridgeApi, loadCredentials, saveCredentials, type Credentials} from "./api";
-import {loadHubPersistence, persistViewState, applyRunEvent, beginRecording, beginStopConfirmation, bindTranscript, cycleSession, detailContent, setReadingPosition, visibleSession, type StopTarget, type ViewState} from "./state";
+import {loadHubPersistence, persistViewState, applyRunEvent, beginRecording, beginStopConfirmation, bindTranscript, cycleSession, setReadingPosition, visibleSession, type StopTarget, type ViewState} from "./state";
 import {HubTransport, StaleActionError, TransportNotReadyError, TransportUnavailableError, UncertainActionError} from "./transport";
+import {approvalDisplay, buildGlassView, detailPages, gestureIsDuplicate, GLASS_HEIGHT, GLASS_WIDTH, type GestureStamp} from "./presentation";
 
 type GlassBridge = Awaited<ReturnType<typeof waitForEvenAppBridge>>;
 const persisted = loadHubPersistence();
@@ -16,6 +17,7 @@ export default function App() {
   const bridgeRef = useRef<GlassBridge | undefined>(undefined);
   const transportRef = useRef<HubTransport | undefined>(undefined);
   const pcmRef = useRef<Uint8Array[]>([]);
+  const gestureRef = useRef<GestureStamp | undefined>(undefined);
   const session = visibleSession(state);
   const approval = state.pending.find((item) => item.sessionId === session?.id);
   const events = session ? state.latestEvents[session.id] ?? [] : [];
@@ -33,7 +35,11 @@ export default function App() {
         const selectedId = loadHubPersistence().selectedSessionId;
         const carousel = [...orderSessions(sessions).slice(0, 9), newSessionRow()];
         const selected = Math.max(0, carousel.findIndex((item) => item.id === selectedId));
-        setState((value) => ({...value, sessions: carousel, selected: selected < 0 ? 0 : selected, detailPage: Math.min(value.readingPositions?.[carousel[selected < 0 ? 0 : selected]?.id] ?? 0, 3), cursor: snapshot.cursor, activeRuns: snapshot.activeRuns ?? [], pending: snapshot.pendingApprovals ?? [], latestEvents: {}, runtime: snapshot.runtime, hermes: snapshot.hermes}));
+        setState((value) => {
+          const selectedIndex = selected < 0 ? 0 : selected;
+          const next = {...value, sessions: carousel, selected: selectedIndex, cursor: snapshot.cursor, activeRuns: snapshot.activeRuns ?? [], pending: snapshot.pendingApprovals ?? [], latestEvents: {}, runtime: snapshot.runtime, hermes: snapshot.hermes};
+          return {...next, detailPage: Math.min(value.readingPositions?.[carousel[selectedIndex]?.id] ?? 0, Math.max(0, detailPages(next).length - 1))};
+        });
       },
       onEvent: receiveEvent,
       onStatus: (status) => {
@@ -90,6 +96,11 @@ export default function App() {
     const pcm = value.audioEvent?.audioPcm ?? value.audioEvent?.pcm ?? value.audioPcm;
     if (pcm) { pcmRef.current.push(pcm instanceof Uint8Array ? pcm : new Uint8Array(pcm)); return; }
     const type = value.textEvent?.eventType ?? value.listEvent?.eventType ?? value.sysEvent?.eventType ?? value.jsonData?.eventType;
+    if (typeof type === "number") {
+      const now = Date.now();
+      if (gestureIsDuplicate(gestureRef.current, type, now)) return;
+      gestureRef.current = {type, at: now};
+    }
     if (type === 3) return setState((current) => { const entering = current.mode !== "detail"; const currentSession = visibleSession(current); return {...current, mode: entering ? "detail" : "default", detailPage: entering ? current.readingPositions?.[currentSession?.id ?? ""] ?? 0 : current.detailPage, stopTarget: undefined}; });
     if (type === 1) return navigate(-1);
     if (type === 2) return navigate(1);
@@ -100,7 +111,7 @@ export default function App() {
     setState((current) => {
       if (current.mode === "approval" || current.mode === "confirmation") return {...current, decisionIndex: Math.max(0, Math.min((approval?.choices.length ?? 1) - 1, current.decisionIndex + delta))};
       if (current.mode === "stopConfirmation") return delta < 0 ? {...current, mode: "detail", stopTarget: undefined, notice: "CANCELLED"} : current;
-      if (current.mode === "detail") return setReadingPosition(current, Math.max(0, Math.min(3, current.detailPage + delta)));
+      if (current.mode === "detail") return setReadingPosition(current, Math.max(0, Math.min(Math.max(0, detailPages(current).length - 1), current.detailPage + delta)));
       if (current.mode === "transcript" && delta > 0) return {...beginRecording(current), notice: "Record again"};
       if (current.mode === "transcript") return {...current, mode: "default", transcript: undefined, recordingSessionId: undefined, transcriptDestination: undefined, notice: "Cancelled"};
       return cycleSession(current, delta);
@@ -114,7 +125,10 @@ export default function App() {
     if (session.id === "__new__") return createSession();
     if (current.mode === "approval") return setState((value) => ({...value, mode: "confirmation"}));
     if (current.mode === "confirmation" && approval) return sendApproval(approval, approval.choices[current.decisionIndex]);
-    if (approval) return setState((value) => ({...value, mode: "approval", decisionIndex: 0}));
+    if (approval) {
+      if (approval.sensitive) return setState((value) => ({...value, notice: "PHONE REQUIRED · SECRET CONTEXT HIDDEN"}));
+      return setState((value) => ({...value, mode: "approval", decisionIndex: 0}));
+    }
     if (current.mode === "stopConfirmation" && current.stopTarget) return sendStop(current.stopTarget);
     if (current.mode === "detail") return setState((value) => { const next = beginStopConfirmation(value); return next === value ? {...value, notice: "NO ACTIVE RUN"} : next; });
     if (current.mode === "transcript" && current.transcript) return sendPrompt(current.transcript.text, current.transcript.sessionId);
@@ -202,7 +216,7 @@ export default function App() {
   }
 }
 
-function Header({session, connected}: {session?: SessionSummary; connected: boolean}) { return <header><b>HERMES</b><span>{session?.title ?? "NO SESSION"}<small>{session ? `${session.source} · ${shortId(session.id)}` : "Pair or create a session"}</small></span><span>{session?.model ?? "—"}<small>{connected ? "CONNECTED" : "OFFLINE"}</small></span></header>; }
+function Header({session, connected}: {session?: SessionSummary; connected: boolean}) { return <header><b>HERMES</b><span>{session?.title ?? "NO SESSION"}<small>{session ? `${session.source.toUpperCase()} · ${shortId(session.id)}${session.workspace ? ` · ${session.workspace.split(/[\\/]/).filter(Boolean).slice(-1)[0]}` : ""}` : "Pair or create a session"}</small></span><span>{session?.model ?? session?.provider ?? "—"}<small>{connected ? "LINK READY" : "LINK OFFLINE"}</small></span></header>; }
 function Body({state, session, approval, latest}: {state: ViewState; session?: SessionSummary; approval?: ApprovalRequest; latest?: DurableEvent}) {
   if (state.phase === "offline") return <section className="body"><label>OFFLINE</label><p>{state.notice ?? "Bridge is unavailable."}</p><strong>WAITING TO RECONNECT</strong></section>;
   if (!state.reconciled || state.phase === "reconciling") return <section className="body"><label>SYNCHRONIZING</label><p>Reconciling a fresh bridge snapshot before accepting actions.</p><strong>PLEASE WAIT</strong></section>;
@@ -210,19 +224,17 @@ function Body({state, session, approval, latest}: {state: ViewState; session?: S
   if (state.phase === "reconnecting") return <section className="body"><label>RECONNECTING</label><p>Bridge connection lost. Pending actions remain retained.</p><strong>NO ACTIONS UNTIL READY</strong></section>;
   if (state.phase === "ready" && !state.connected) return <section className="body"><label>CONNECTING</label><p>Snapshot is current; opening the authenticated event stream.</p><strong>PLEASE WAIT</strong></section>;
   if (state.transcript) return <section className="body transcript"><label>VOICE TRANSCRIPT</label><p>“{state.transcript.text}”</p><aside>DESTINATION · {session?.title} · {shortId(state.transcript.sessionId)}</aside><strong>PRESS SEND · ↓ CANCEL · ↑ AGAIN</strong></section>;
-  if (approval) { const choice = approval.choices[state.decisionIndex]; return <section className="body"><label>ACTION REQUIRED · {approval.tool}</label><p>{approval.command ?? approval.destination ?? "Hermes requests permission to continue."}</p><ul>{approval.choices.map((item, index) => <li className={index === state.decisionIndex ? "selected" : ""} key={item}>{index === state.decisionIndex ? "■" : "□"} {item.toUpperCase()}</li>)}</ul><strong>{state.mode === "confirmation" ? `PRESS AGAIN TO CONFIRM ${choice?.toUpperCase()}` : "SWIPE CHOICE · PRESS SELECT"}</strong></section>; }
+  if (approval) { const display = approvalDisplay(approval, state.decisionIndex, state.mode); return <section className={`body approval${display.phoneOnly ? " phone-only" : ""}`}><label>{display.phoneOnly ? "PHONE REQUIRED" : `ACTION REQUIRED · ${approval.tool.toUpperCase()}`}</label><p>{display.body}</p>{!display.phoneOnly && <ul>{display.choices.map((item, index) => <li className={index === state.decisionIndex ? "selected" : ""} key={`${item}-${index}`}>{index === state.decisionIndex ? "■" : "□"} {item}</li>)}</ul>}<strong>{display.phoneOnly ? "OPEN PAIRED PHONE" : state.mode === "confirmation" ? `PRESS AGAIN TO CONFIRM ${display.selected}` : "SWIPE CHOICE · PRESS SELECT"}</strong></section>; }
   if (state.mode === "stopConfirmation" && state.stopTarget) return <section className="body"><label>CONFIRM RUN CANCELLATION</label><p>Stop run {shortId(state.stopTarget.runId)} in {session?.title} · {shortId(state.stopTarget.sessionId)}?</p><aside>The destination is locked and cannot change.</aside><strong>PRESS CONFIRM · ↓ CANCEL</strong></section>;
   if (state.mode === "detail") return <Detail state={state} session={session}/>;
   if (state.mode === "recording") return <section className="body"><label>LISTENING</label><p>Recording for {session?.title}. The destination is now locked.</p><strong>PRESS TO STOP · 45 SECOND MAX</strong></section>;
-  return <section className="body"><label>{session?.state === "busy" ? "CURRENT CHECKPOINT" : latest?.kind?.toUpperCase() ?? "LATEST ANSWER"}</label><p>{summary(latest, session, session ? state.history[session.id] : undefined)}</p><aside>{session?.executionReady ? "EXECUTION READY" : "UNBOUND · WORKSPACE TOOLS BLOCKED"}</aside><strong>PRESS TO SPEAK · DOUBLE PRESS DETAIL</strong></section>;
+  const view = buildGlassView(state);
+  return <section className="body"><label>{session?.state === "busy" ? "CURRENT CHECKPOINT" : latest?.kind?.toUpperCase() ?? "LATEST ANSWER"}</label><p className="body-copy">{view.body}</p><aside>{session?.executionReady ? "EXECUTION READY" : "UNBOUND · WORKSPACE TOOLS BLOCKED"}</aside><strong>PRESS TO SPEAK · DOUBLE PRESS DETAIL</strong></section>;
 }
-function Detail({state, session}: {state: ViewState; session?: SessionSummary}) { const events = session ? state.latestEvents[session.id] ?? [] : []; const history = session ? state.history[session.id] ?? [] : []; const activeRun = session ? state.activeRuns.find((run) => run.sessionId === session.id) : undefined; const pages = [{title: "FULL ANSWER", text: latestAssistant(history)?.content ?? [...events].reverse().find((event) => event.kind === "message.completed")?.payload}, {title: "TOOLS", text: events.filter((event) => event.kind.startsWith("tool.")).slice(-6).map((event) => event.payload)}, {title: "SUBAGENTS", text: events.filter((event) => event.kind.startsWith("subagent.")).slice(-6).map((event) => event.payload)}, {title: "PROVENANCE", text: session}]; const pageIndex = Math.max(0, Math.min(pages.length - 1, state.detailPage)); const page = pages[pageIndex]; return <section className="body detail"><label>{page.title} · {pageIndex + 1}/4</label><pre>{format(page.text)}</pre><strong>{activeRun ? `PRESS TO STOP ${shortId(activeRun.runId)} · DOUBLE PRESS BACK` : "SWIPE PAGES · DOUBLE PRESS BACK"}</strong></section>; }
+function Detail({state, session}: {state: ViewState; session?: SessionSummary}) { const pages = detailPages(state); const pageIndex = Math.max(0, Math.min(pages.length - 1, state.detailPage)); const page = pages[pageIndex]; const activeRun = session ? state.activeRuns.find((run) => run.sessionId === session.id) : undefined; return <section className="body detail"><label>{page.title} · {pageIndex + 1}/{pages.length}</label><pre>{page.text}</pre><strong>{activeRun ? `PRESS TO STOP ${shortId(activeRun.runId)} · DOUBLE PRESS BACK` : "SWIPE PAGES · DOUBLE PRESS BACK"}</strong></section>; }
 function Pairing({onSave}: {onSave: (credentials: Credentials) => void}) { const [origin, setOrigin] = useState("https://hridyas-mini.tail59dec9.ts.net/hermes-g2"); const [code, setCode] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const pair = async () => { setBusy(true); setError(""); try { onSave(await BridgeApi.exchange(origin, code)); } catch (value) { setError(String(value)); setBusy(false); } }; return <main className="pairing"><h1>Hermes G2</h1><p>Enter the 90-second, single-use Hub code from the Mac mini. The bridge issues this G2 its own revocable credential; the Hermes master key never enters the app.</p><input aria-label="Bridge origin" value={origin} onChange={(event) => setOrigin(event.target.value.replace(/\/$/, ""))}/><input aria-label="Pairing code" inputMode="numeric" placeholder="6-digit pairing code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}/>{error && <p role="alert">{error}</p>}<button disabled={busy || !origin.startsWith("https://") || code.length !== 6} onClick={() => void pair()}>{busy ? "Pairing…" : "Pair private G2"}</button></main>; }
 
-function renderGlass(state: ViewState) { const session = visibleSession(state); const approval = state.pending.find((item) => item.sessionId === session?.id); const latest = session ? state.latestEvents[session.id]?.at(-1) : undefined; const header = session ? `HERMES  ${session.title.slice(0, 24)}  ${shortId(session.id)}  ${state.connected ? "●" : "○"}` : "HERMES  NO SESSION"; let body = state.phase === "offline" ? `OFFLINE\n\n${state.notice ?? "Bridge is unavailable."}` : !state.reconciled ? "SYNCHRONIZING\n\nWaiting for a fresh bridge snapshot." : state.phase === "gap" ? "REPLAY GAP\n\nRebuilding from a fresh snapshot." : state.phase === "reconnecting" ? "RECONNECTING\n\nPending actions retained." : state.phase === "ready" && !state.connected ? "CONNECTING\n\nOpening the authenticated event stream." : summary(latest, session, session ? state.history[session.id] : undefined); if (state.mode === "detail") body = detailContent(state); if (state.mode === "recording") body = `LISTENING\n\nDestination locked: ${session?.title}\n${shortId(state.recordingSessionId ?? "")}`; if (state.transcript) body = `CONFIRM DESTINATION\n${session?.title} · ${shortId(state.transcript.sessionId)}\n\n${state.transcript.text}\n\nPRESS SEND · ↓ CANCEL · ↑ AGAIN`; if (approval) body = `APPROVAL · ${approval.tool}\n${approval.command ?? approval.destination ?? "Action requires permission"}\n\n${approval.choices.map((choice, index) => `${index === state.decisionIndex ? "■" : "□"} ${choice.toUpperCase()}`).join("   ")}\n\n${state.mode === "confirmation" ? "PRESS AGAIN TO CONFIRM" : "SWIPE · PRESS SELECT"}`; if (state.mode === "stopConfirmation" && state.stopTarget) body = `CONFIRM RUN CANCELLATION\n${session?.title} · ${shortId(state.stopTarget.sessionId)}\nRun ${shortId(state.stopTarget.runId)}\n\nPRESS CONFIRM · ↓ CANCEL`; const item = (id: number, name: string, y: number, height: number, content: string, capture = 0) => new TextContainerProperty({containerID: id, containerName: name, xPosition: 12, yPosition: y, width: 552, height, borderWidth: 0, borderColor: 15, borderRadius: 0, paddingLength: 2, content, isEventCapture: capture}); return {containerTotalNum: 3, textObject: [item(1, "header", 8, 34, header), item(2, "body", 50, 180, body, 1), item(3, "footer", 238, 38, `${state.selected + 1}/${Math.max(1, state.sessions.length)}   ${state.pending.length} PENDING   ${state.notice ?? outboxNotice(state.outbox) ?? state.phase?.toUpperCase() ?? session?.state.toUpperCase() ?? "OFFLINE"}`)]}; }
-function summary(event?: DurableEvent, session?: SessionSummary, history?: AgentMessage[]): string { if (session?.id === "__new__") return "Press to create a fresh Hermes session owned by Even G2."; const payload = event?.payload as Record<string, unknown> | string | undefined; if (typeof payload === "string") return payload.slice(0, 600); return String(payload?.summary ?? payload?.message ?? payload?.content ?? latestAssistant(history)?.content ?? session?.latestAnswer ?? (session ? "Press to speak a continuation into this exact session." : "Pair the private bridge to begin.")); }
-function latestAssistant(history?: AgentMessage[]): AgentMessage | undefined { return history?.find((message) => message.role === "assistant" && message.content.trim()); }
-function format(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value ?? "No activity yet.", null, 2); }
+function renderGlass(state: ViewState) { const view = buildGlassView(state); const footerY = GLASS_HEIGHT - 50; const item = (id: number, name: string, y: number, height: number, content: string, capture = 0) => new TextContainerProperty({containerID: id, containerName: name, xPosition: 12, yPosition: y, width: GLASS_WIDTH - 24, height, borderWidth: 0, borderColor: 15, borderRadius: 0, paddingLength: 2, content, isEventCapture: capture}); return {containerTotalNum: 3, textObject: [item(1, "header", 8, 34, view.header), item(2, "body", 50, footerY - 58, view.body, 1), item(3, "footer", footerY, 38, view.footer)]}; }
 function shortId(value: string): string { return value.length > 12 ? `${value.slice(0, 5)}…${value.slice(-4)}` : value; }
 function idempotencyKey(): string { return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `g2-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`; }
 function outboxNotice(items: ViewState["outbox"]): string | undefined {
