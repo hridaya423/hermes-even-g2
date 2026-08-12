@@ -48,5 +48,5 @@ cp "$project_dir/apps/android/app/build/outputs/apk/debug/app-debug.apk" "$artif
 python3 "$project_dir/scripts/write-release-manifest.py" "$artifact_dir/manifest.json" hermes-even-g2 \
   HermesG2.ehpk "$artifact_dir/HermesG2.ehpk" \
   hermes-g2-debug.apk "$artifact_dir/hermes-g2-debug.apk"
-shasum -a 256 "$artifact_dir/HermesG2.ehpk" "$artifact_dir/hermes-g2-debug.apk" > "$artifact_dir/SHA256SUMS"
+(cd "$artifact_dir" && shasum -a 256 HermesG2.ehpk hermes-g2-debug.apk > SHA256SUMS)
 print "Local release artifacts and SHA-256 manifest written to $artifact_dir. Physical G2, Doze, reboot and Mac-mini power-cycle acceptance remain deployment tests."
