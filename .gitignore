@@ -15,3 +15,11 @@ build/
 *.ehpk
 *.apk
 local.properties
+
+# Release bundles are separate from transient build output. Their hashes pin
+# the exact EHPK/APK that was verified and can be committed or published.
+!release/
+!release/*.ehpk
+!release/*.apk
+!release/*.json
+!release/SHA256SUMS

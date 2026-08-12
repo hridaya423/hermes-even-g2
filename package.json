@@ -6,8 +6,10 @@
   "scripts": {
     "build": "npm run build -w @hermes-g2/protocol && npm run build -w @hermes-g2/hub",
     "test": "npm run test -w @hermes-g2/protocol && npm run test -w @hermes-g2/hub",
-    "typecheck": "npm run typecheck -w @hermes-g2/protocol && npm run typecheck -w @hermes-g2/hub"
+    "typecheck": "npm run typecheck -w @hermes-g2/protocol && npm run typecheck -w @hermes-g2/hub",
+    "doctor": "zsh scripts/audit-mac-mini.sh",
+    "verify:release": "zsh scripts/verify-release.sh",
+    "test:release": "zsh scripts/test-verify-release.sh"
   },
   "engines": {"node": ">=22"}
 }
-

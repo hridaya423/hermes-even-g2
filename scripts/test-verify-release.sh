@@ -15,3 +15,9 @@ if (( protocol_build_line >= typecheck_line )); then
   print -u2 "The protocol package must be built before the Hub typecheck."
   exit 1
 fi
+
+for required in "run_started" "HERMES_RELEASE_DIR" "SHA256SUMS" "write-release-manifest.py" "artifact_mtime" "placeholder credential"; do
+  rg -F "$required" "$release_script" >/dev/null || { print -u2 "Release gate is missing: $required"; exit 1; }
+done
+zsh -n "$release_script" "$project_dir/scripts/test-verify-release.sh" "$project_dir/scripts/audit-mac-mini.sh"
+python3 -c 'from pathlib import Path; path = Path(__import__("sys").argv[1]); compile(path.read_text(), str(path), "exec")' "$project_dir/scripts/write-release-manifest.py"
