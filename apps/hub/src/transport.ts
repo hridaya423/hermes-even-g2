@@ -61,9 +61,12 @@ type StoredOutbox = {
   createdAt: string;
   error?: string;
   nextAttemptAt?: number;
+  completedAt?: number;
 };
 
 const OUTBOX_KEY = "hermes-g2.outbox";
+const MAX_COMPLETED_OUTBOX = 100;
+const COMPLETED_OUTBOX_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_RECONNECT: ReconnectOptions = {baseDelayMs: 500, maxDelayMs: 30_000, jitter: 0.2};
 
 function browserStorage(): StorageLike | undefined {
@@ -142,7 +145,7 @@ function outboxStorageValue(storage: StorageLike | undefined): StoredOutbox[] {
       if (!value.action || typeof value.action !== "object" || typeof value.action.idempotencyKey !== "string") return [];
       const status = value.status === "sending" ? "uncertain" : value.status;
       if (!["queued", "retry", "uncertain", "stale", "completed"].includes(status ?? "")) return [];
-      return [{action: value.action as AgentAction, status: status as OutboxStatus, attempts: Number(value.attempts) || 0, createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date(0).toISOString(), error: typeof value.error === "string" ? value.error : undefined, nextAttemptAt: typeof value.nextAttemptAt === "number" ? value.nextAttemptAt : undefined}];
+      return [{action: value.action as AgentAction, status: status as OutboxStatus, attempts: Number(value.attempts) || 0, createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date(0).toISOString(), error: typeof value.error === "string" ? value.error : undefined, nextAttemptAt: typeof value.nextAttemptAt === "number" ? value.nextAttemptAt : undefined, completedAt: typeof value.completedAt === "number" && Number.isFinite(value.completedAt) ? value.completedAt : undefined}];
     });
   } catch {
     return [];
@@ -195,6 +198,7 @@ class ActionOutbox {
     try {
       const result = await this.api.action(entry.action);
       entry.status = "completed";
+      entry.completedAt = this.now();
       this.persist();
       return result;
     } catch (error) {
@@ -231,12 +235,23 @@ class ActionOutbox {
   }
 
   private persist(notify = true): void {
+    this.pruneCompleted();
     if (this.storage) {
       try { this.storage.setItem(OUTBOX_KEY, JSON.stringify(this.entries)); } catch { /* WebView quota is non-fatal */ }
       const previous = loadHubPersistence(this.storage);
       saveHubPersistence({...previous, idempotencyKeys: [...previous.idempotencyKeys, ...this.entries.map((item) => item.action.idempotencyKey)]}, this.storage);
     }
     if (notify) this.onChange();
+  }
+
+  private pruneCompleted(): void {
+    const cutoff = this.now() - COMPLETED_OUTBOX_RETENTION_MS;
+    const recent = this.entries
+      .filter((entry) => entry.status === "completed")
+      .filter((entry) => entry.completedAt === undefined || entry.completedAt >= cutoff)
+      .slice(-MAX_COMPLETED_OUTBOX);
+    const keep = new Set(recent);
+    this.entries = this.entries.filter((entry) => entry.status !== "completed" || keep.has(entry));
   }
 }
 
@@ -255,6 +270,7 @@ export class HubTransport {
   private stopped = false;
   private resnapshotInFlight = false;
   private startPromise: Promise<void> | undefined;
+  private lifecycleGeneration = 0;
   private _status: HubTransportStatus;
 
   constructor(private readonly api: HubApiAdapter, options: HubTransportOptions = {}) {
@@ -273,8 +289,11 @@ export class HubTransport {
     if (this.startPromise) return this.startPromise;
     this.stopped = false;
     this.started = true;
+    const generation = ++this.lifecycleGeneration;
     this.transition({phase: "reconciling", connected: false, reconciled: false, error: undefined});
-    this.startPromise = this.reconcile().catch((error) => {
+    this.startPromise = this.reconcile(generation).catch((error) => {
+      if (this.stopped || generation !== this.lifecycleGeneration) return;
+      this.startPromise = undefined;
       this.transition({phase: "offline", connected: false, error: errorMessage(error)});
       this.scheduleReconnect();
       throw error;
@@ -283,8 +302,10 @@ export class HubTransport {
   }
 
   stop(): void {
+    this.lifecycleGeneration += 1;
     this.stopped = true;
     this.started = false;
+    this.startPromise = undefined;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     if (this.outboxRetryTimer) clearTimeout(this.outboxRetryTimer);
@@ -311,8 +332,9 @@ export class HubTransport {
     await this.resnapshot("manual snapshot refresh");
   }
 
-  private async reconcile(): Promise<void> {
+  private async reconcile(generation = this.lifecycleGeneration): Promise<void> {
     const snapshot = await this.api.snapshot();
+    if (this.stopped || generation !== this.lifecycleGeneration) return;
     this.applySnapshot(snapshot);
     this.transition({phase: "ready", connected: false, reconciled: true, error: undefined, reconnectAttempt: 0});
     this.openChannel(snapshot.cursor);
@@ -396,7 +418,7 @@ export class HubTransport {
     if (this.stopped || !this.started) return;
     try {
       if (!this._status.reconciled) {
-        await this.reconcile();
+        await this.reconcile(this.lifecycleGeneration);
         return;
       }
       if (this.api.replay) {
@@ -440,7 +462,10 @@ export class HubTransport {
         await this.api.acknowledge(cursor);
       }
       if (!page.hasMore) return "ok";
-      if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor) return "gap";
+      // The bridge returns the last event cursor in this page, so it equals
+      // the cursor after applying the page. Comparing against `cursor` here
+      // would reject every multi-page replay after the first page.
+      if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= pageStart || page.nextCursor !== cursor) return "gap";
       cursor = page.nextCursor;
     }
   }
@@ -448,10 +473,12 @@ export class HubTransport {
   private async resnapshot(reason: string): Promise<void> {
     if (this.resnapshotInFlight || this.stopped) return;
     this.resnapshotInFlight = true;
+    const generation = this.lifecycleGeneration;
     this.transition({phase: "gap", connected: false, error: reason});
     this.invalidateSocket();
     try {
       const snapshot = await this.api.snapshot();
+      if (this.stopped || generation !== this.lifecycleGeneration) return;
       this.applySnapshot(snapshot);
       this.reconnectAttempt = 0;
       this.transition({phase: "ready", connected: false, reconciled: true, reconnectAttempt: 0, error: undefined});

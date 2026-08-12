@@ -5,10 +5,48 @@ export type Credentials = {origin: string; deviceId: string; credential: string}
 export type Snapshot = {protocolVersion?: "1.0"; sessions: SessionSummary[] | {items?: SessionSummary[]}; cursor: number; runtime: RuntimeReadiness; hermes: HermesCapabilities; activeRuns?: ActiveRun[]; pendingApprovals?: ApprovalRequest[]};
 export type RevokeResult = {supported: boolean; revoked: boolean};
 
-export class BridgeApi implements HubApiAdapter {
-  private readonly acknowledgementCreatedAt = new Map<number, string>();
+const ACKNOWLEDGEMENT_TIMES_KEY = "hermes-g2.acknowledgement-times";
 
-  constructor(public readonly credentials: Credentials) {}
+function acknowledgementStorageKey(deviceId: string): string {
+  return `${ACKNOWLEDGEMENT_TIMES_KEY}.${encodeURIComponent(deviceId)}`;
+}
+
+function loadAcknowledgementTimes(deviceId: string): Map<number, string> {
+  if (typeof localStorage === "undefined") return new Map();
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(acknowledgementStorageKey(deviceId)) ?? "{}");
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
+    const entries = Object.entries(parsed as Record<string, unknown>)
+      .flatMap(([cursor, value]): [number, string][] => {
+        const numericCursor = Number(cursor);
+        return Number.isSafeInteger(numericCursor) && numericCursor >= 0 && typeof value === "string" && !Number.isNaN(Date.parse(value))
+          ? [[numericCursor, value]]
+          : [];
+      })
+      .sort(([left], [right]) => left - right)
+      .slice(-200);
+    return new Map(entries);
+  } catch {
+    return new Map();
+  }
+}
+
+function saveAcknowledgementTimes(deviceId: string, values: Map<number, string>): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    const entries = [...values.entries()].sort(([left], [right]) => left - right).slice(-200);
+    localStorage.setItem(acknowledgementStorageKey(deviceId), JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // A denied or full WebView store must not stop event acknowledgement.
+  }
+}
+
+export class BridgeApi implements HubApiAdapter {
+  private readonly acknowledgementCreatedAt: Map<number, string>;
+
+  constructor(public readonly credentials: Credentials) {
+    this.acknowledgementCreatedAt = loadAcknowledgementTimes(credentials.deviceId);
+  }
 
   private headers(extra?: HeadersInit): HeadersInit {
     return {Authorization: `Bearer ${this.credentials.credential}`, "X-Device-Id": this.credentials.deviceId, ...extra};
@@ -61,6 +99,7 @@ export class BridgeApi implements HubApiAdapter {
     const idempotencyKey = `hub-ack-${this.credentials.deviceId}-${value}`;
     const createdAt = this.acknowledgementCreatedAt.get(value) ?? new Date().toISOString();
     this.acknowledgementCreatedAt.set(value, createdAt);
+    saveAcknowledgementTimes(this.credentials.deviceId, this.acknowledgementCreatedAt);
     await this.action({kind: "acknowledge", deviceId: this.credentials.deviceId, idempotencyKey, createdAt, payload: {cursor: value}});
   }
 

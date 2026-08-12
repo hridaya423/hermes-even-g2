@@ -193,6 +193,63 @@ describe("Hub transport recovery", () => {
     expect(transport.status.cursor).toBe(20);
   });
 
+  it("replays multiple HTTP pages when nextCursor is the last event cursor", async () => {
+    const first = new FakeSocket();
+    const second = new FakeSocket();
+    let sockets = 0;
+    const replay = vi.fn()
+      .mockResolvedValueOnce({events: [event(8), event(9)], nextCursor: 9, hasMore: true, latestCursor: 10})
+      .mockResolvedValueOnce({events: [event(10)], nextCursor: 10, hasMore: false, latestCursor: 10});
+    const api: HubApiAdapter = {
+      snapshot: vi.fn().mockResolvedValue(snapshot(7)),
+      action: vi.fn().mockResolvedValue({status: "ok"}),
+      websocketUrl: (cursor) => `wss://bridge.test/v1/channel?after=${cursor}`,
+      replay,
+      credentials: {deviceId: "device", credential: "credential"},
+    };
+    const received: DurableEvent[] = [];
+    const transport = new HubTransport(api, {
+      storage: memoryStorage(),
+      webSocketFactory: () => (sockets++ === 0 ? first : second),
+      onEvent: (value) => received.push(value),
+      reconnect: {baseDelayMs: 0, maxDelayMs: 0, jitter: 0},
+    });
+    await transport.start();
+    first.open();
+    first.close();
+
+    await vi.waitFor(() => expect(replay).toHaveBeenCalledTimes(2));
+    second.open();
+    expect(received.map((value) => value.cursor)).toEqual([8, 9, 10]);
+    expect(transport.status.cursor).toBe(10);
+    expect(transport.status.phase).toBe("ready");
+  });
+
+  it("can be started again after stop instead of returning the old promise", async () => {
+    const first = new FakeSocket();
+    const second = new FakeSocket();
+    let sockets = 0;
+    const api: HubApiAdapter = {
+      snapshot: vi.fn().mockResolvedValueOnce(snapshot(1)).mockResolvedValueOnce(snapshot(2)),
+      action: vi.fn().mockResolvedValue({status: "ok"}),
+      websocketUrl: (cursor) => `wss://bridge.test/v1/channel?after=${cursor}`,
+      replay: vi.fn().mockResolvedValue({events: [], nextCursor: 2, hasMore: false, latestCursor: 2}),
+    };
+    const transport = new HubTransport(api, {
+      storage: memoryStorage(),
+      webSocketFactory: () => (sockets++ === 0 ? first : second),
+    });
+    const firstStart = transport.start();
+    await firstStart;
+    transport.stop();
+    const secondStart = transport.start();
+    expect(secondStart).not.toBe(firstStart);
+    await secondStart;
+    expect(api.snapshot).toHaveBeenCalledTimes(2);
+    expect(transport.status.cursor).toBe(2);
+    transport.stop();
+  });
+
   it("retains an action while disconnected and flushes the same idempotency key after WSS opens", async () => {
     const socket = new FakeSocket();
     const api: HubApiAdapter = {
@@ -209,6 +266,25 @@ describe("Hub transport recovery", () => {
     await vi.waitFor(() => expect(api.action).toHaveBeenCalledTimes(1));
     expect(transport.status.outbox[0]?.status).toBe("completed");
     expect((api.action as ReturnType<typeof vi.fn>).mock.calls[0]?.[0].idempotencyKey).toBe(action.idempotencyKey);
+  });
+
+  it("keeps the completed outbox bounded while retaining recent results", async () => {
+    const socket = new FakeSocket();
+    const api: HubApiAdapter = {
+      snapshot: vi.fn().mockResolvedValue(snapshot(7)),
+      action: vi.fn().mockResolvedValue({status: "ok"}),
+      websocketUrl: () => "wss://bridge.test/v1/channel?after=7",
+    };
+    const transport = new HubTransport(api, {storage: memoryStorage(), webSocketFactory: () => socket});
+    await transport.start();
+    socket.open();
+
+    for (let index = 0; index < 125; index += 1) {
+      await transport.dispatch({...action, idempotencyKey: `bounded-${String(index).padStart(4, "0")}`});
+    }
+
+    expect(transport.status.outbox.length).toBeLessThanOrEqual(100);
+    expect(transport.status.outbox.at(-1)?.status).toBe("completed");
   });
 
   it("surfaces stale actions and uncertain network outcomes for deliberate retry", async () => {
