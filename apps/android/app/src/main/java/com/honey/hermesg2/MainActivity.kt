@@ -20,6 +20,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -43,6 +44,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         var credentials by remember { mutableStateOf(SecureCredentials(this).load()) }
         if (credentials == null) return Pairing { SecureCredentials(this).save(it); credentials = it; startConnection() }
         val client = remember(credentials) { BridgeClient(credentials!!) }
+        val stateRepository = remember { HermesStateRepository.get(this@MainActivity) }
+        val persistedState by stateRepository.state.collectAsState()
         var snapshot by remember { mutableStateOf<Snapshot?>(null) }
         var selected by remember { mutableStateOf<SessionSummary?>(null) }
         var history by remember { mutableStateOf<MessagePage?>(null) }
@@ -72,9 +75,28 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 }.onFailure { error = it.message }
             }
         }
-        LaunchedEffect(Unit) { if (Build.VERSION.SDK_INT >= 33) notifications.launch(Manifest.permission.POST_NOTIFICATIONS); startConnection(); runCatching { client.snapshot() }.onSuccess { snapshot = it; selected = it.sessions.firstOrNull { session -> session.id == deepLinkSession } ?: it.sessions.firstOrNull() }.onFailure { error = it.message } }
+        LaunchedEffect(persistedState.hasSnapshot, persistedState.selectedSessionId) {
+            if (snapshot == null && persistedState.hasSnapshot) {
+                snapshot = persistedState.snapshot
+                selected = persistedState.snapshot.sessions.firstOrNull { session -> session.id == deepLinkSession }
+                    ?: persistedState.snapshot.sessions.firstOrNull { session -> session.id == persistedState.selectedSessionId }
+                    ?: persistedState.snapshot.sessions.firstOrNull()
+            }
+        }
+        LaunchedEffect(Unit) {
+            if (Build.VERSION.SDK_INT >= 33) notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+            startConnection()
+            val restored = stateRepository.current()
+            runCatching { client.snapshot() }.onSuccess { fresh ->
+                stateRepository.persistSnapshot(fresh)
+                snapshot = fresh
+                selected = fresh.sessions.firstOrNull { session -> session.id == deepLinkSession }
+                    ?: fresh.sessions.firstOrNull { session -> session.id == restored.selectedSessionId }
+                    ?: fresh.sessions.firstOrNull()
+            }.onFailure { error = it.message }
+        }
         LaunchedEffect(tab) { auxiliary = when (tab) { "Jobs" -> { jobs = if (snapshot?.hermes?.jobs == true) runCatching { client.jobs() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.jobs == true) "" else "Jobs are not advertised by this Hermes build." }; "Models" -> { modelOptions = if (snapshot?.hermes?.models == true) runCatching { client.modelOptions() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.models == true) "" else "Model options are unavailable." }; "Skills" -> { skillsInventory = if (snapshot?.hermes?.skills == true) runCatching { client.skills() }.getOrElse { error = it.message; null } else null; if (snapshot?.hermes?.skills == true) "" else "Skills are not advertised by this Hermes build." }; "Security" -> { devices = runCatching { client.devices() }.getOrElse { error = it.message; null }; runCatching { client.audit() }.getOrElse { it.message.orEmpty() } }; else -> "" } }
-        LaunchedEffect(selected?.id) { pendingAttachments = emptyList(); history = selected?.let { session -> runCatching { client.messages(session.id) }.getOrElse { error = it.message; null } } }
+        LaunchedEffect(selected?.id) { stateRepository.persistSelectedSession(selected?.id); pendingAttachments = emptyList(); history = selected?.let { session -> runCatching { client.messages(session.id) }.getOrElse { error = it.message; null } } }
         Scaffold(topBar = { TopAppBar(title = { Text("Hermes G2") }, actions = { TextButton(onClick = { scope.launch { client.action(AgentAction("createSession", credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("title" to "G2 session"))); snapshot = client.snapshot() } }) { Text("New session") }; IconButton(onClick = { scope.launch { snapshot = client.snapshot() } }) { Icon(Icons.Default.Refresh, "Refresh") } }) }, bottomBar = { NavigationBar { listOf("Sessions" to Icons.AutoMirrored.Filled.Chat, "Jobs" to Icons.Default.Schedule, "Models" to Icons.Default.Tune, "Skills" to Icons.Default.Build, "Security" to Icons.Default.Security).forEach { (name, icon) -> NavigationBarItem(tab == name, { tab = name }, { Icon(icon, name) }, label = { Text(name) }) } } }) { padding ->
             if (tab == "Jobs") JobsPane(jobs, auxiliary, onAction = { kind, jobId -> scope.launch { runCatching { client.action(AgentAction(kind, credentials!!.deviceId, UUID.randomUUID().toString(), createdAt = Instant.now().toString(), payload = mapOf("jobId" to jobId))) }.onSuccess { jobs = client.jobs() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab == "Models") ModelPane(modelOptions, selected, onSelect = { provider, model -> selected?.let { session -> scope.launch { runCatching { client.action(AgentAction("setSessionModel", credentials!!.deviceId, UUID.randomUUID().toString(), session.id, createdAt = Instant.now().toString(), payload = mapOf("provider" to provider, "model" to model))) }.onSuccess { snapshot = client.snapshot(); selected = snapshot?.sessions?.firstOrNull { it.id == session.id } }.onFailure { error = it.message } } } }, Modifier.padding(padding)) else if (tab == "Skills") SkillsPane(skillsInventory, auxiliary, Modifier.padding(padding)) else if (tab == "Security") SecurityPane(devices, credentials!!.deviceId, auxiliary, onRevoke = { deviceId -> scope.launch { runCatching { client.revokeDevice(deviceId) }.onSuccess { devices = client.devices() }.onFailure { error = it.message } } }, Modifier.padding(padding)) else if (tab != "Sessions") AuxiliaryPane(tab, auxiliary, Modifier.padding(padding)) else Row(Modifier.padding(padding).fillMaxSize()) {
                 LazyColumn(Modifier.width(320.dp).fillMaxHeight()) { item { Readiness(snapshot?.runtime, error) }; snapshot?.pendingApprovals?.firstOrNull()?.let { approval -> item { ApprovalPane(approval, snapshot!!.hermes.sessionApprovalResponse) { choice -> scope.launch { runCatching { client.action(AgentAction(mapOf("once" to "approveOnce", "session" to "approveSession", "always" to "approveAlways", "deny" to "deny").getValue(choice), credentials!!.deviceId, UUID.randomUUID().toString(), approval.sessionId, approval.runId, "awaiting_approval", Instant.now().toString(), mapOf("requestId" to approval.requestId))) }.onSuccess { snapshot = client.snapshot() }.onFailure { error = it.message } } } } }; items(snapshot?.sessions.orEmpty(), key = { it.id }) { session -> ListItem(headlineContent = { Text(session.title) }, supportingContent = { Text("${session.source} · ${session.state}") }, leadingContent = { Icon(if (session.pinned) Icons.Default.PushPin else Icons.Default.ChatBubbleOutline, null) }, modifier = Modifier.fillMaxWidth(), trailingContent = { IconButton(onClick = { selected = session }) { Icon(Icons.Default.ChevronRight, "Open") } }); HorizontalDivider() } }

@@ -36,3 +36,18 @@ import kotlinx.serialization.json.JsonElement
     val latestCursor: Long = 0,
     val requiresSnapshot: Boolean = false,
 )
+
+/**
+ * The Android process may be killed between receiving a bridge event and the
+ * next connection attempt.  Keep the complete recovery boundary in one
+ * serializable value so the foreground service and the Compose controller see
+ * the same durable state after a reboot.
+ */
+@Serializable data class HermesPersistedState(
+    val hasSnapshot: Boolean = false,
+    val snapshot: Snapshot = Snapshot(),
+    val events: List<DurableEvent> = emptyList(),
+    val pendingEvents: List<DurableEvent> = emptyList(),
+    val lastAckedCursor: Long = 0,
+    val selectedSessionId: String? = null,
+)
